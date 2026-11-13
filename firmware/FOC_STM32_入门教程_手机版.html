@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f172a">
+  <title>FOC 与 STM32 入门</title>
+  <style>
+    :root { color-scheme: light; --ink:#172033; --muted:#5d687b; --line:#dbe2ec; --blue:#1769aa; --soft:#f4f7fb; --code:#111827; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:#eef2f7; color:var(--ink); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; font-size:18px; line-height:1.78; }
+    main { max-width:760px; margin:0 auto; padding:22px 18px 48px; background:#fff; min-height:100vh; }
+    h1 { margin:0 0 8px; font-size:30px; line-height:1.3; }
+    h2 { margin:34px 0 10px; font-size:24px; line-height:1.4; border-left:5px solid var(--blue); padding-left:10px; }
+    h3 { margin:22px 0 6px; font-size:20px; }
+    p { margin:10px 0; }
+    .lead { color:var(--muted); margin-top:0; }
+    .box { background:var(--soft); border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin:16px 0; }
+    .flow { font-weight:600; text-align:center; line-height:2.1; }
+    code { background:#eef2f7; border-radius:4px; padding:1px 5px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:.9em; }
+    pre { overflow-x:auto; background:var(--code); color:#e5edf8; border-radius:8px; padding:14px 15px; font-size:15px; line-height:1.6; -webkit-overflow-scrolling:touch; }
+    pre code { background:none; padding:0; color:inherit; }
+    ul, ol { padding-left:1.35em; }
+    li { margin:5px 0; }
+    .path { color:var(--blue); word-break:break-all; }
+    footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--line); color:var(--muted); font-size:14px; }
+    @media (max-width:420px) { body { font-size:17px; } main { padding:18px 15px 38px; } h1 { font-size:27px; } h2 { font-size:22px; } pre { font-size:14px; padding:12px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>FOC 与 STM32 入门</h1>
+  <p class="lead">基于本项目：STM32F103C8T6 + AS5600 + SimpleFOCmini + 2804 电机</p>
+
+  <div class="box"><strong>先记住一句话：</strong><br>STM32 负责高速重复计算，AS5600 提供转子位置，FOC 根据位置计算三相 PWM，SimpleFOCmini 放大 PWM 去驱动电机。</div>
+
+  <div class="box flow">
+    AS5600<br>↓ I²C 读取机械角度<br>STM32 定时器中断<br>↓ FOC 计算<br>TIM3 三路 PWM<br>↓<br>SimpleFOCmini → 2804 电机
+  </div>
+
+  <h2>1. STM32 在项目中的角色</h2>
+  <p>启动代码主要在 <span class="path">Core/Src/main.c</span>：</p>
+  <pre><code>HAL_Init();
+SystemClock_Config();
+
+MX_GPIO_Init();
+MX_I2C1_Init();
+MX_TIM3_Init();
+MX_TIM1_Init();
+
+FOC_Init(...);
+TIM_Init();</code></pre>
+  <ul>
+    <li><code>GPIO</code>：控制 PB1 使能脚和 LED。</li>
+    <li><code>I2C1</code>：通过 PB6/PB7 读取 AS5600。</li>
+    <li><code>TIM3</code>：通过 PA6、PA7、PB0 输出三相 PWM。</li>
+    <li><code>TIM1</code>：产生固定频率的 FOC 控制中断。</li>
+  </ul>
+
+  <h2>2. AS5600 如何提供角度</h2>
+  <p>代码在 <span class="path">Bsp/Src/angle_as5600.c</span>。STM32 向 AS5600 指定角度寄存器，然后读取两个字节：</p>
+  <pre><code>HAL_I2C_Mem_Read(
+    hi2c, 0x6C, 0x0C,
+    I2C_MEMADD_SIZE_8BIT,
+    buf, 2, 50
+);</code></pre>
+  <p>本项目中：</p>
+  <ul>
+    <li>AS5600 的 7 位地址是 <code>0x36</code>。</li>
+    <li>STM32 HAL 使用左移后的地址，所以代码写成 <code>0x6C</code>。</li>
+    <li>角度寄存器从 <code>0x0C</code> 开始。</li>
+    <li>AS5600 返回 12 位角度值，范围是 0 到 4095。</li>
+  </ul>
+  <pre><code>angle = raw * (360.0f / 4096.0f);</code></pre>
+
+  <h2>3. FOC 控制循环</h2>
+  <p>控制调度主要在 <span class="path">Drv/Src/drv_tim.c</span>。TIM1 产生约 20 kHz 中断，程序分频后每约 1 ms 执行一次 <code>Motor_Loop()</code>。</p>
+  <p>每次控制循环大致是：</p>
+  <pre><code>读取 AS5600
+→ 计算机械角度和速度
+→ 计算目标角度误差
+→ PID 计算 Uq
+→ 计算三相电压
+→ 更新 PWM</code></pre>
+
+  <h2>4. 位置控制怎样工作</h2>
+  <p>核心代码在 <span class="path">App/Src/motor_ctrl.c</span> 和 <span class="path">App/Src/Foc.c</span>：</p>
+  <pre><code>FOC_PosCtrl(&amp;Motor);
+FOC_SpdCtrl(&amp;Motor);
+FOC_Output(&amp;Motor);</code></pre>
+  <ol>
+    <li><code>FOC_PosCtrl()</code>：比较目标角度和当前角度。</li>
+    <li><code>FOC_SpdCtrl()</code>：根据速度误差计算需要的力矩电压 <code>Uq</code>。</li>
+    <li><code>FOC_Output()</code>：把 <code>Uq</code> 和电角度转换为三相 PWM。</li>
+  </ol>
+  <p>可以先这样理解：</p>
+  <div class="box">角度误差大 → 需要更快转<br>速度误差大 → 需要更大 Uq<br>Uq + 电角度 → 三相 PWM</div>
+
+  <h2>5. 为什么极对数是 7</h2>
+  <p>你的电机参数是 <code>12N14P</code>：</p>
+  <ul>
+    <li>12 个定子槽。</li>
+    <li>14 个转子磁极。</li>
+    <li>极对数 = 14 ÷ 2 = 7。</li>
+  </ul>
+  <p>代码中对应：</p>
+  <pre><code>.pole_pairs = 7,</code></pre>
+  <p>机械角度转电角度时：</p>
+  <pre><code>电角度 = 机械角度 × 7</code></pre>
+  <p>极对数错误时，常见现象是抖动、嗡嗡响、不转或发热。</p>
+
+  <h2>6. PWM 与 SimpleFOCmini</h2>
+  <pre><code>PA6 → TIM3_CH1 → IN1
+PA7 → TIM3_CH2 → IN2
+PB0 → TIM3_CH3 → IN3
+PB1 → EN</code></pre>
+  <p>三路 PWM 经过 SimpleFOCmini 的功率级，形成三相驱动电压。当前项目有安全开关：</p>
+  <pre><code>#define MOTOR_POWER_STAGE_ENABLED 0U</code></pre>
+  <p>值为 <code>0</code> 时，PB1 不拉高、PWM 不启动，电机不会被使能。接入合适的 12 V 电源并确认接线后，才考虑改为 <code>1U</code>。</p>
+
+  <h2>7. 推荐学习顺序</h2>
+  <ol>
+    <li>看懂 <code>MX_I2C1_Init()</code>，知道 PB6/PB7 怎样初始化。</li>
+    <li>看懂 <code>AS5600_ReadAngle()</code>，理解一次角度读取。</li>
+    <li>看懂 <code>MX_TIM3_Init()</code>，理解 PWM 通道。</li>
+    <li>看懂 <code>TIM_Init()</code>，理解控制中断。</li>
+    <li>跟踪 <code>Motor_Loop()</code> 的执行顺序。</li>
+    <li>最后再学习 Clarke、Park、反 Park 和 SVPWM。</li>
+  </ol>
+  <div class="box"><strong>入门检查：</strong>先能回答三个问题：AS5600 的角度从哪里读出来？FOC 每隔多久计算一次？三路 PWM 输出到哪些引脚？</div>
+
+  <footer>本教程对应当前 PicoFOC 工程，适合先建立整体认识；具体疑问可以按文件、函数或某一行代码继续深入。</footer>
+</main>
+</body>
+</html>
