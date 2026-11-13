@@ -13,6 +13,7 @@ typedef struct
     float detent_spacing_deg;       /**< 机械角卡点间距 */
     float detent_strength_v_per_deg; /**< 连续卡点曲线增益 */
     float damping_v_per_rpm;        /**< 速度阻尼增益 */
+    float detent_damping_v_per_rpm; /**< 卡点附近附加阻尼 */
     float max_uq_v;                 /**< 输出电压上限 */
     float max_speed_rpm;            /**< 参与阻尼计算的速度上限 */
 } SmartKnobConfig_t;

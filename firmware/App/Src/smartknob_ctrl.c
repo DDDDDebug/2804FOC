@@ -9,6 +9,7 @@
 #define SMARTKNOB_DEFAULT_SPACING_DEG       30.0f
 #define SMARTKNOB_DEFAULT_STRENGTH_V_PER_DEG 0.120f
 #define SMARTKNOB_DEFAULT_DAMPING_V_PER_RPM  0.002f
+#define SMARTKNOB_DEFAULT_DETENT_DAMPING_V_PER_RPM 0.012f
 #define SMARTKNOB_DEFAULT_MAX_UQ_V           0.80f
 #define SMARTKNOB_DEFAULT_MAX_SPEED_RPM      60.0f
 #define SMARTKNOB_HARD_MAX_UQ_V              0.80f
@@ -64,6 +65,9 @@ static void sanitize_config(SmartKnobConfig_t *config)
     if (config->damping_v_per_rpm < 0.0f) {
         config->damping_v_per_rpm = 0.0f;
     }
+    if (config->detent_damping_v_per_rpm < 0.0f) {
+        config->detent_damping_v_per_rpm = 0.0f;
+    }
     if (config->max_uq_v < 0.0f) {
         config->max_uq_v = 0.0f;
     }
@@ -84,6 +88,7 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->config.detent_spacing_deg = SMARTKNOB_DEFAULT_SPACING_DEG;
     knob->config.detent_strength_v_per_deg = SMARTKNOB_DEFAULT_STRENGTH_V_PER_DEG;
     knob->config.damping_v_per_rpm = SMARTKNOB_DEFAULT_DAMPING_V_PER_RPM;
+    knob->config.detent_damping_v_per_rpm = SMARTKNOB_DEFAULT_DETENT_DAMPING_V_PER_RPM;
     knob->config.max_uq_v = SMARTKNOB_DEFAULT_MAX_UQ_V;
     knob->config.max_speed_rpm = SMARTKNOB_DEFAULT_MAX_SPEED_RPM;
     knob->target_angle_deg = 0.0f;
@@ -134,6 +139,8 @@ float SmartKnob_Update(SmartKnob_t *knob,
     float command;
     float phase_rad;
     float detent_peak_v;
+    float proximity;
+    float dynamic_damping;
 
     (void)dt_s;
     if (knob == 0) {
@@ -170,7 +177,11 @@ float SmartKnob_Update(SmartKnob_t *knob,
     detent_peak_v = knob->config.detent_strength_v_per_deg * spacing
                   / (2.0f * 3.14159265359f);
     command = -detent_peak_v * sinf(phase_rad);
-    command -= knob->config.damping_v_per_rpm * speed;
+    proximity = fabsf(cosf(phase_rad));
+    dynamic_damping = knob->config.damping_v_per_rpm
+                    + knob->config.detent_damping_v_per_rpm
+                    * proximity * proximity;
+    command -= dynamic_damping * speed;
     knob->output_uq_v = clampf(command,
                                -knob->config.max_uq_v,
                                knob->config.max_uq_v);
