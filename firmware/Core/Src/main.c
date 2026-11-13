@@ -62,11 +62,384 @@ float vofa_message[8];
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 static void IWDG_Init(void);
+#if MOTOR_COMMUNICATION_ENABLED
 static void VOFA_SendDebug(void);
+#endif
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+static uint8_t ResetOneShot_ConsumeArm(void);
+#endif
+#if MOTOR_DIAGNOSTIC_D1
+static uint8_t D1_ResetSequence_ConsumeArm(void);
+static void D1_DiagnosticStep(void);
+#endif
+#if MOTOR_DIAGNOSTIC_D2
+static uint8_t D2_ResetSequence_ConsumeArm(void);
+static void D2_DiagnosticStep(void);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+/*
+ * Two-reset safety latch for the temporary S1 capture build.
+ *
+ * A fresh boot (including the reset issued after ST-Link programming) writes
+ * a two-word marker and remains fully disabled. Only the next manual reset
+ * consumes that marker and permits one health-gated alignment attempt. The
+ * marker is cleared before enabling the bridge, so a later reset arms again
+ * instead of repeating the movement.
+ */
+#if MOTOR_SMARTKNOB_ENABLED
+#define RESET_ARM_MARKER_A  0x5345U
+#define RESET_ARM_MARKER_B  0x454BU
+#elif MOTOR_S3B_STEP_ONE_SHOT
+#define RESET_ARM_MARKER_A  0x5334U
+#define RESET_ARM_MARKER_B  0x3448U
+#elif MOTOR_S3_HOLD_ONE_SHOT
+#define RESET_ARM_MARKER_A  0x5333U
+#define RESET_ARM_MARKER_B  0x3348U
+#elif MOTOR_S2_RESET_ONE_SHOT
+#define RESET_ARM_MARKER_A  0x5332U
+#define RESET_ARM_MARKER_B  0x3253U
+#elif MOTOR_S2_OFFSET_COMMIT_ONE_SHOT
+#define RESET_ARM_MARKER_A  0x5343U
+#define RESET_ARM_MARKER_B  0x4353U
+#else
+#define RESET_ARM_MARKER_A  0x5341U
+#define RESET_ARM_MARKER_B  0x314DU
+#endif
+
+static uint8_t ResetOneShot_ConsumeArm(void)
+{
+  uint16_t marker_a;
+  uint16_t marker_b;
+  uint8_t armed;
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_RCC_BKP_CLK_ENABLE();
+  PWR->CR |= PWR_CR_DBP;
+
+  marker_a = BKP->DR1;
+  marker_b = BKP->DR2;
+  armed = (marker_a == RESET_ARM_MARKER_A && marker_b == RESET_ARM_MARKER_B) ? 1U : 0U;
+
+  if (armed != 0U)
+  {
+    BKP->DR1 = 0U;
+    BKP->DR2 = 0U;
+  }
+  else
+  {
+    BKP->DR1 = RESET_ARM_MARKER_A;
+    BKP->DR2 = RESET_ARM_MARKER_B;
+  }
+
+  PWR->CR &= ~PWR_CR_DBP;
+  return armed;
+}
+#endif
+
+#if MOTOR_DIAGNOSTIC_D1
+/*
+ * D1 uses independent backup-register markers so a programming reset cannot
+ * accidentally start the measurement. The first boot arms; only the next
+ * manual reset consumes the arm and runs the finite diagnostic sequence.
+ */
+#define D1_ARM_MARKER_A  0x4431U
+#define D1_ARM_MARKER_B  0x3144U
+
+typedef enum
+{
+  D1_STATE_BASELINE = 0,
+  D1_STATE_PWM_A,
+  D1_STATE_QUIET_A,
+  D1_STATE_PB1_ONLY,
+  D1_STATE_QUIET_B,
+  D1_STATE_PWM_B,
+  D1_STATE_COMPLETE,
+} D1_State_t;
+
+static uint8_t g_d1_run_after_reset;
+
+static uint8_t D1_ResetSequence_ConsumeArm(void)
+{
+  uint16_t marker_a;
+  uint16_t marker_b;
+  uint8_t armed;
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_RCC_BKP_CLK_ENABLE();
+  PWR->CR |= PWR_CR_DBP;
+
+  marker_a = BKP->DR1;
+  marker_b = BKP->DR2;
+  armed = (marker_a == D1_ARM_MARKER_A && marker_b == D1_ARM_MARKER_B) ? 1U : 0U;
+
+  if (armed != 0U)
+  {
+    BKP->DR1 = 0U;
+    BKP->DR2 = 0U;
+  }
+  else
+  {
+    BKP->DR1 = D1_ARM_MARKER_A;
+    BKP->DR2 = D1_ARM_MARKER_B;
+  }
+
+  PWR->CR &= ~PWR_CR_DBP;
+  return armed;
+}
+
+static void D1_StopAllOutputs(void)
+{
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1, 0U);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, 0U);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3, 0U);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3);
+}
+
+static void D1_StartPwmOnly(void)
+{
+  uint32_t neutral_compare = htim3.Init.Period / 2U;
+
+  /* PB1 stays low: these pulses must remain electrically non-driving. */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1, neutral_compare);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, neutral_compare);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3, neutral_compare);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+}
+
+static void D1_DiagnosticStep(void)
+{
+  static D1_State_t state = D1_STATE_BASELINE;
+  static uint32_t state_start_ms;
+  static uint8_t initialized;
+  uint32_t now_ms = HAL_GetTick();
+
+  if (initialized == 0U)
+  {
+    /* Start the baseline timer only after all peripherals are initialized. */
+    D1_StopAllOutputs();
+    state = D1_STATE_BASELINE;
+    state_start_ms = now_ms;
+    initialized = 1U;
+  }
+
+  if (g_d1_run_after_reset == 0U)
+  {
+    return;
+  }
+
+  switch (state)
+  {
+  case D1_STATE_BASELINE:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_BASELINE_MS)
+    {
+      D1_StartPwmOnly();
+      state = D1_STATE_PWM_A;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D1_STATE_PWM_A:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_PWM_WINDOW_MS)
+    {
+      D1_StopAllOutputs();
+      state = D1_STATE_QUIET_A;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D1_STATE_QUIET_A:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_QUIET_MS)
+    {
+      /* PWM is explicitly stopped before this short PB1-only observation. */
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+      state = D1_STATE_PB1_ONLY;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D1_STATE_PB1_ONLY:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_PB1_ONLY_MS)
+    {
+      D1_StopAllOutputs();
+      state = D1_STATE_QUIET_B;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D1_STATE_QUIET_B:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_QUIET_MS)
+    {
+      D1_StartPwmOnly();
+      state = D1_STATE_PWM_B;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D1_STATE_PWM_B:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_DIAG_PWM_WINDOW_MS)
+    {
+      D1_StopAllOutputs();
+      state = D1_STATE_COMPLETE;
+      g_d1_run_after_reset = 0U;
+    }
+    break;
+
+  case D1_STATE_COMPLETE:
+  default:
+    D1_StopAllOutputs();
+    break;
+  }
+}
+#endif
+#if MOTOR_DIAGNOSTIC_D2
+/*
+ * D2 is a two-reset, finite diagnostic. It first shows PB1 alone, then PB1
+ * with all three PWM outputs at the same 50% duty. It does not run the FOC
+ * control loop, alignment, PID, speed, position, or torque control.
+ */
+#define D2_ARM_MARKER_A  0x4432U
+#define D2_ARM_MARKER_B  0x3244U
+
+typedef enum
+{
+  D2_STATE_BASELINE = 0,
+  D2_STATE_PB1_ONLY,
+  D2_STATE_QUIET,
+  D2_STATE_COMBINED,
+  D2_STATE_COMPLETE,
+} D2_State_t;
+
+static uint8_t g_d2_run_after_reset;
+
+static uint8_t D2_ResetSequence_ConsumeArm(void)
+{
+  uint16_t marker_a;
+  uint16_t marker_b;
+  uint8_t armed;
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_RCC_BKP_CLK_ENABLE();
+  PWR->CR |= PWR_CR_DBP;
+
+  marker_a = BKP->DR1;
+  marker_b = BKP->DR2;
+  armed = (marker_a == D2_ARM_MARKER_A && marker_b == D2_ARM_MARKER_B) ? 1U : 0U;
+
+  if (armed != 0U)
+  {
+    BKP->DR1 = 0U;
+    BKP->DR2 = 0U;
+  }
+  else
+  {
+    BKP->DR1 = D2_ARM_MARKER_A;
+    BKP->DR2 = D2_ARM_MARKER_B;
+  }
+
+  PWR->CR &= ~PWR_CR_DBP;
+  return armed;
+}
+
+static void D2_StopAllOutputs(void)
+{
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1, 0U);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, 0U);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3, 0U);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_3);
+}
+
+static void D2_StartCombinedNeutral(void)
+{
+  uint32_t neutral_compare = htim3.Init.Period / 2U;
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_1, neutral_compare);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_2, neutral_compare);
+  __HAL_TIM_SetCompare(&htim3, TIM_CHANNEL_3, neutral_compare);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+}
+
+static void D2_DiagnosticStep(void)
+{
+  static D2_State_t state = D2_STATE_BASELINE;
+  static uint32_t state_start_ms;
+  static uint8_t initialized;
+  uint32_t now_ms = HAL_GetTick();
+
+  if (initialized == 0U)
+  {
+    D2_StopAllOutputs();
+    state = D2_STATE_BASELINE;
+    state_start_ms = now_ms;
+    initialized = 1U;
+  }
+
+  if (g_d2_run_after_reset == 0U)
+  {
+    return;
+  }
+
+  switch (state)
+  {
+  case D2_STATE_BASELINE:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_D2_BASELINE_MS)
+    {
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+      state = D2_STATE_PB1_ONLY;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D2_STATE_PB1_ONLY:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_D2_PB1_ONLY_MS)
+    {
+      D2_StopAllOutputs();
+      state = D2_STATE_QUIET;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D2_STATE_QUIET:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_D2_QUIET_MS)
+    {
+      D2_StartCombinedNeutral();
+      state = D2_STATE_COMBINED;
+      state_start_ms = now_ms;
+    }
+    break;
+
+  case D2_STATE_COMBINED:
+    if ((uint32_t)(now_ms - state_start_ms) >= MOTOR_D2_COMBINED_MS)
+    {
+      D2_StopAllOutputs();
+      state = D2_STATE_COMPLETE;
+      g_d2_run_after_reset = 0U;
+    }
+    break;
+
+  case D2_STATE_COMPLETE:
+  default:
+    D2_StopAllOutputs();
+    break;
+  }
+}
+#endif
 /* USER CODE END 0 */
 
 /**
@@ -91,6 +464,15 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+  Motor_SetResetOneShotArmed(ResetOneShot_ConsumeArm());
+#endif
+#if MOTOR_DIAGNOSTIC_D1
+  g_d1_run_after_reset = D1_ResetSequence_ConsumeArm();
+#endif
+#if MOTOR_DIAGNOSTIC_D2
+  g_d2_run_after_reset = D2_ResetSequence_ConsumeArm();
+#endif
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -190,11 +572,13 @@ int main(void)
    *  UARTProto_Init() : 使能 UART RX 中断（收到 UART 帧 → 调 MotorMsg_OnFrameReceived）
    *  TIM_Init()       : 最后启动时基中断（TIM1 硬件 20kHz → 软件 20 分频 → 1kHz FOC 循环）
    * ================================================================ */
+  MotorMsg_Init();    /* 先初始化消息总线 */
+#if MOTOR_COMMUNICATION_ENABLED
   CAN_Init();
   HAL_Delay(100);
-  MotorMsg_Init();    /* 先初始化消息总线 */
   CANProto_Init(1);    /* 再注册 CAN 回调，电机ID=1 → RX=0x001 TX=0x101 */
   UARTProto_Init();   /* 再使能 UART 接收 */
+#endif
   TIM_Init();
 
   /* LED 初始状态：待机心跳（满亮度闪烁），覆盖默认的常灭 */
@@ -206,7 +590,10 @@ int main(void)
    *
    *  Motor_Loop()  : TIM1 中断 → 1kHz FOC 流水线
    * ================================================================ */
+#if !MOTOR_DIAGNOSTIC_D2
+  /* D2 isolates PB1/PWM coexistence, so do not run the normal FOC callback. */
   TIM_RegisterCallback(Motor_Loop);
+#endif
 
   /* ---- 启动独立看门狗（~2s 超时，主循环 + Motor_Loop 双重喂狗） ---- */
   IWDG_Init();
@@ -217,9 +604,24 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+      static uint32_t last_as5600_poll_ms = 0U;
+      uint32_t now_ms = HAL_GetTick();
+
       IWDG_REFRESH();   /* 喂独立看门狗 */
-      AS5600_Poll(&hi2c1);
+#if MOTOR_DIAGNOSTIC_D1
+      D1_DiagnosticStep();
+#endif
+#if MOTOR_DIAGNOSTIC_D2
+      D2_DiagnosticStep();
+#endif
+      if ((uint32_t)(now_ms - last_as5600_poll_ms) >= AS5600_POLL_PERIOD_MS)
+      {
+          AS5600_Poll(&hi2c1);
+          last_as5600_poll_ms = now_ms;
+      }
+#if MOTOR_COMMUNICATION_ENABLED
       VOFA_SendDebug();
+#endif
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -322,8 +724,9 @@ static void IWDG_Init(void)
  *   ch0 = 机械角度 (deg)        ch1 = 目标角度 (deg)
  *   ch2 = 转速 (rpm)            ch3 = 目标转速 (rpm)
  *   ch4 = Uq 电压 (V)           ch5 = 运行模式 (int)
- *   ch6 = 最近指令目标值          ch7 = 保留
+ *   ch6 = 最近指令目标值          ch7 = AS5600 健康状态 (0/1)
  */
+#if MOTOR_COMMUNICATION_ENABLED
 static void VOFA_SendDebug(void)
 {
     /* 仅 CAN 模式下发送 VOFA+（UART 模式下让带宽给自定义协议 1kHz） */
@@ -337,10 +740,13 @@ static void VOFA_SendDebug(void)
     vofa_message[4] = Motor.Uq;                   /* ch4：Uq 输出电压 (V)       */
     vofa_message[5] = (float)MotorMsg_GetLastMode(); /* ch5：运行模式 (int)      */
     vofa_message[6] = MotorMsg_GetLastTarget();   /* ch6：最近指令目标值         */
-    vofa_message[7] = 0.0f;                       /* ch7：保留                  */
+    vofa_message[7] = (float)AS5600_IsHealthy(
+        AS5600_HEALTH_MIN_SAMPLES,
+        AS5600_MAX_SAMPLE_AGE_MS);                 /* ch7：AS5600 健康状态       */
 
     UARTProto_SendVOFA(vofa_message, 8);
 }
+#endif
 
 /* USER CODE END 4 */
 

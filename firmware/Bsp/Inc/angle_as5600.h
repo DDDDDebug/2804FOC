@@ -14,6 +14,7 @@
 
 #include "i2c.h"
 #include "angle_sensor.h"
+#include <stdint.h>
 
 /**
  * @brief  创建 AS5600 传感器实例（填充 AngleSensor_t 接口）
@@ -33,6 +34,15 @@ extern volatile uint32_t g_as5600_poll_ok;
 extern volatile uint32_t g_as5600_poll_error;
 extern volatile uint32_t g_as5600_last_error;
 extern volatile uint16_t g_as5600_last_raw;
+extern volatile uint32_t g_as5600_last_success_ms;
+
+/**
+ * @brief  Returns 1 only after repeated, recent successful I2C samples.
+ * @note   Safe to call from the 1 kHz control ISR; all inspected values are
+ *         naturally atomic on Cortex-M3.
+ */
+uint8_t AS5600_IsHealthy(uint32_t min_success_samples,
+                         uint32_t max_sample_age_ms);
 
 /**
  * @brief  读取原始角度值（0 ~ 4095，12 位）

@@ -28,6 +28,7 @@
  *  修改值 → 重新编译烧录即可。
  * ================================================================ */
 #define FOC_ELEC_OFFSET     0.0f
+#define FOC_CALIBRATION_RECORD_VERSION  0x534B0001UL
 
 #include <stdint.h>
 #include "angle_sensor.h"
@@ -38,6 +39,23 @@
 #include "foc_math.h"
 #include "data_process.h"
 #include "observer.h"
+
+typedef enum
+{
+    FOC_POWER_STAGE_DISABLED = 0,
+    FOC_POWER_STAGE_PRELOAD,
+    FOC_POWER_STAGE_ENABLED
+} FocPowerStageState_t;
+
+typedef struct
+{
+    uint32_t version;
+    float    elec_offset;
+    uint8_t  pole_pairs;
+    int8_t   sensor_direction;
+    uint16_t reserved;
+    uint32_t checksum;
+} FocCalibrationRecord_t;
 
 typedef struct
 {
@@ -89,9 +107,21 @@ typedef struct
     float    current_raw[3];        /**< 三相电流 (A)，当前未使用恒为 0 */
 
     /* ==== 电角度校准 ==== */
-    uint16_t calib_flag;            /**< 校准标志：1 = 正在校准 */
-    uint32_t calib_count;           /**< 校准计数 */
+    uint16_t calib_flag;            /**< 开环流程：1 = S1 对齐，2 = S2 方向扫动 */
+    uint32_t calib_count;           /**< 已过校准时间（ms，仅供状态观察） */
+    uint32_t calib_start_ms;        /**< 本次校准开始的 HAL 时基（ms） */
     float    elec_offset;           /**< 电角度零点偏移 */
+    uint8_t  calibration_record_valid; /**< 已加载并校验的持久化记录 */
+    float    calib_offset_candidate;/**< 本次校准的待确认偏移，不自动写 Flash */
+    uint8_t  calib_candidate_captured; /**< 已在稳定保持阶段捕获候选偏移 */
+    uint8_t  calib_result_ready;    /**< 候选偏移已生成，等待方向/相序验证 */
+
+    /* ==== 功率级启用状态 ==== */
+    FocPowerStageState_t power_stage_state;
+    uint32_t power_stage_count;
+
+    /* Dedicated S3A hold controller state (not a PID state). */
+    float    s3_hold_uq;
 
 } FOC_t;
 
@@ -131,7 +161,23 @@ void FOC_Enable(FOC_t *foc);
 /** @brief 关闭电机输出（PB1 拉低 + PWM 停止 + PID 积分清零） */
 void FOC_Disable(FOC_t *foc);
 
-/** @brief 执行单步电角度校准（注入 Ud=4V 拉转子到 d 轴对齐） */
-void FOC_CalibStep(FOC_t *foc);
+/** @brief PWM 已预装载且 PB1 已拉高时返回 1。 */
+uint8_t FOC_IsPowerStageReady(const FOC_t *foc);
+
+/** @brief 返回当前加载的版本化电角偏移记录是否有效。 */
+uint8_t FOC_IsCalibrationValid(const FOC_t *foc);
+
+/** @brief 执行单步电角度校准（Ud 由 0 V 缓升、保持并缓降） */
+void FOC_CalibStep(FOC_t *foc, uint32_t elapsed_ms);
+
+/** @brief 执行 S2 开环电角度扫动（低压、一次、无 PID）。 */
+void FOC_S2DirectionStep(FOC_t *foc, uint32_t elapsed_ms);
+
+/** @brief S3A 独立静态保持控制（低压、死区、变化率限幅，不使用 PID）。 */
+void FOC_S3HoldReset(FOC_t *foc);
+void FOC_S3HoldStep(FOC_t *foc, float target_angle);
+
+/** @brief 将已验证的候选偏移作为带校验的记录保存到参数页。 */
+uint8_t FOC_CommitCalibration(FOC_t *foc);
 
 #endif

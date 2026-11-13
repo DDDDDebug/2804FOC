@@ -14,6 +14,7 @@
 
 #include "Foc.h"
 #include "main.h"
+#include <string.h>
 
 /* ---- 全局单电机实例 ---- */
 FOC_t Motor = {0};
@@ -28,6 +29,49 @@ static float FOC_ApplySensorDirection(const FOC_t *foc, float raw_angle)
     }
 
     return raw_angle;
+}
+
+static void FOC_ResetControlState(FOC_t *foc)
+{
+    foc->PosPID.integral = 0.0f;
+    foc->PosPID.output = 0.0f;
+    foc->SpdPID.integral = 0.0f;
+    foc->SpdPID.output = 0.0f;
+    foc->SpdPID_Ext.integral = 0.0f;
+    foc->SpdPID_Ext.output = 0.0f;
+    foc->Uq = 0.0f;
+    foc->Ud = 0.0f;
+    foc->s3_hold_uq = 0.0f;
+}
+
+static uint32_t FOC_FloatBits(float value)
+{
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static uint32_t FOC_CalibrationChecksum(const FocCalibrationRecord_t *record)
+{
+    uint32_t metadata = (uint32_t)record->pole_pairs
+                      | ((uint32_t)(uint8_t)record->sensor_direction << 8)
+                      | ((uint32_t)record->reserved << 16);
+
+    return record->version ^ FOC_FloatBits(record->elec_offset)
+           ^ metadata ^ 0xA5C39E71UL;
+}
+
+static uint8_t FOC_IsCalibrationRecordValid(const FOC_t *foc,
+                                             const FocCalibrationRecord_t *record)
+{
+    float max_offset = (float)foc->pole_pairs * 360.0f;
+
+    return (record->version == FOC_CALIBRATION_RECORD_VERSION
+            && record->pole_pairs == foc->pole_pairs
+            && record->sensor_direction == foc->dir
+            && record->checksum == FOC_CalibrationChecksum(record)
+            && record->elec_offset >= 0.0f
+            && record->elec_offset < max_offset) ? 1U : 0U;
 }
 
 /* ================================================================
@@ -65,14 +109,28 @@ void FOC_Init(FOC_t *foc,
     foc->last_speed      = foc->speed;
     foc->elec_angle      = (float)cfg->pole_pairs * foc->mech_angle;
 
-    /* 优先从非易失存储读取已保存的零点偏移，失败回退到宏默认值 */
-    if (!foc->storage->read(foc->storage->ctx,
-                             &foc->elec_offset,
-                             sizeof(foc->elec_offset)))
+    /* Only accept a versioned record matching this pole count and direction.
+       The legacy single-float value has no such safeguards and is ignored. */
+    FocCalibrationRecord_t record;
+    if (!foc->storage->read(foc->storage->ctx, &record, sizeof(record))
+        || !FOC_IsCalibrationRecordValid(foc, &record))
     {
         foc->elec_offset = FOC_ELEC_OFFSET;
+        foc->calibration_record_valid = 0U;
     }
-    foc->calib_flag   = 0;
+    else
+    {
+        foc->elec_offset = record.elec_offset;
+        foc->calibration_record_valid = 1U;
+    }
+    foc->calib_flag             = 0U;
+    foc->calib_count            = 0U;
+    foc->calib_start_ms         = 0U;
+    foc->calib_offset_candidate = foc->elec_offset;
+    foc->calib_candidate_captured = 0U;
+    foc->calib_result_ready     = 0U;
+    foc->power_stage_state      = FOC_POWER_STAGE_DISABLED;
+    foc->power_stage_count      = 0U;
 
     /*
      * Startup is always safe: output remains disabled until FOC_Enable().
@@ -217,13 +275,20 @@ void FOC_SpdCtrl_Ext(FOC_t *foc)
  * ================================================================ */
 void FOC_Enable(FOC_t *foc)
 {
+    /* Keep PB1 low while PWM compare registers and output channels settle. */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+
 #if MOTOR_POWER_STAGE_ENABLED
+    foc->motor->set_duty(foc->motor->ctx, 0.5f, 0.5f, 0.5f);
     foc->motor->enable(foc->motor->ctx);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+    foc->power_stage_state = FOC_POWER_STAGE_PRELOAD;
+    foc->power_stage_count = 0U;
 #else
     /* Virtual mode is hard-disabled at both the GPIO and PWM layers. */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
     foc->motor->disable(foc->motor->ctx);
+    foc->power_stage_state = FOC_POWER_STAGE_DISABLED;
+    foc->power_stage_count = 0U;
+    foc->calib_start_ms = 0U;
 #endif
 }
 
@@ -241,14 +306,21 @@ void FOC_Disable(FOC_t *foc)
     /* 停止 PWM 输出 */
     foc->motor->disable(foc->motor->ctx);
 
-    /* 清零全部 PID 积分（防 windup） */
-    foc->PosPID.integral     = 0.0f;
-    foc->SpdPID.integral     = 0.0f;
-    foc->SpdPID_Ext.integral = 0.0f;
+    foc->power_stage_state = FOC_POWER_STAGE_DISABLED;
+    foc->power_stage_count = 0U;
 
-    /* 清零输出电压 */
-    foc->Uq = 0.0f;
-    foc->Ud = 0.0f;
+    /* 清零全部 PID 积分（防 windup） */
+    FOC_ResetControlState(foc);
+}
+
+uint8_t FOC_IsPowerStageReady(const FOC_t *foc)
+{
+    return (foc->power_stage_state == FOC_POWER_STAGE_ENABLED) ? 1U : 0U;
+}
+
+uint8_t FOC_IsCalibrationValid(const FOC_t *foc)
+{
+    return (foc->calibration_record_valid != 0U) ? 1U : 0U;
 }
 
 /* ================================================================
@@ -264,21 +336,80 @@ void FOC_Disable(FOC_t *foc)
  * ================================================================ */
 void FOC_Output(FOC_t *foc)
 {
+    if (foc->power_stage_state == FOC_POWER_STAGE_PRELOAD)
+    {
+        /* PB1 is still low here, so this cannot generate motor torque. */
+        foc->motor->set_duty(foc->motor->ctx, 0.5f, 0.5f, 0.5f);
+        if (++foc->power_stage_count >= (uint32_t)MOTOR_PWM_PRELOAD_TIME_MS)
+        {
+            FOC_ResetControlState(foc);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+            foc->power_stage_state = FOC_POWER_STAGE_ENABLED;
+        }
+        return;
+    }
+
+    if (foc->power_stage_state != FOC_POWER_STAGE_ENABLED)
+    {
+        return;
+    }
+
+    uint8_t open_loop_test_active = 0U;
+
     /* ---- 电角度校准流程 ---- */
     if (foc->calib_flag == 1)
     {
-        foc->elec_offset = 0.0f;
-        FOC_CalibStep(foc);
-        if (foc->calib_count++ >=
-            ((uint32_t)MOTOR_ALIGNMENT_TIME_MS * (uint32_t)foc->rate) / 1000U)
+        open_loop_test_active = 1U;
+        uint32_t elapsed_ms;
+
+        if (foc->calib_start_ms == 0U)
         {
-            /* 校准完成：记录当前电角度作为零点偏移 */
-            foc->elec_offset = (float)foc->pole_pairs
-                             * FOC_ApplySensorDirection(
-                                   foc, foc->sensor->read_angle(foc->sensor->ctx));
-            foc->calib_flag = 0;
-            foc->Ud = 0.0f;
+            foc->calib_start_ms = HAL_GetTick();
         }
+        elapsed_ms = (uint32_t)(HAL_GetTick() - foc->calib_start_ms);
+        foc->calib_count = elapsed_ms;
+        FOC_CalibStep(foc, elapsed_ms);
+        if (elapsed_ms >= (MOTOR_ALIGNMENT_RAMP_UP_MS
+                           + MOTOR_ALIGNMENT_HOLD_MS)
+            && foc->calib_candidate_captured == 0U)
+        {
+            /* Capture while the d-axis vector is still at full strength. */
+            foc->calib_offset_candidate = (float)foc->pole_pairs
+                                       * FOC_ApplySensorDirection(
+                                             foc, foc->sensor->read_angle(foc->sensor->ctx));
+            foc->calib_candidate_captured = 1U;
+        }
+        if (elapsed_ms >= (MOTOR_ALIGNMENT_RAMP_UP_MS
+                           + MOTOR_ALIGNMENT_HOLD_MS
+                           + MOTOR_ALIGNMENT_RAMP_DOWN_MS))
+        {
+            /* Save only a candidate. Direction and phase order are not yet
+               verified, so no calibration result may be committed here. */
+            if (foc->calib_candidate_captured == 0U)
+            {
+                foc->calib_offset_candidate = (float)foc->pole_pairs
+                                           * FOC_ApplySensorDirection(
+                                                 foc, foc->sensor->read_angle(foc->sensor->ctx));
+                foc->calib_candidate_captured = 1U;
+            }
+            foc->calib_result_ready = 1U;
+            foc->calib_flag = 0U;
+            foc->Ud = 0.0f;
+            foc->calib_start_ms = 0U;
+        }
+    }
+    else if (foc->calib_flag == 2U)
+    {
+        uint32_t elapsed_ms;
+
+        open_loop_test_active = 1U;
+        if (foc->calib_start_ms == 0U)
+        {
+            foc->calib_start_ms = HAL_GetTick();
+        }
+        elapsed_ms = (uint32_t)(HAL_GetTick() - foc->calib_start_ms);
+        foc->calib_count = elapsed_ms;
+        FOC_S2DirectionStep(foc, elapsed_ms);
     }
 
     /* ---- 电角度前馈补偿 ----
@@ -299,7 +430,9 @@ void FOC_Output(FOC_t *foc)
      *
      * 补偿系数定义于 motor_config.h。
      * ================================================================ */
-    float angle_advance = foc->speed * (float)foc->pole_pairs * 6.0f * ANGLE_COMP_DELAY_S;
+    float angle_advance = (open_loop_test_active != 0U)
+        ? 0.0f
+        : foc->speed * (float)foc->pole_pairs * 6.0f * ANGLE_COMP_DELAY_S;
     float comp_elec_angle = foc->elec_angle + angle_advance;
 
     /* ---- (Ud, Uq) 矢量限幅 —— 防止进入过调制区 ----
@@ -355,11 +488,175 @@ void FOC_Output(FOC_t *foc)
  *  注入低 Ud、Uq=0 → 转子被拉到 d 轴对齐 → 此时编码器读数 = 电角度零点偏移。
  *  校准时长和电压由 motor_config.h 统一配置。
  * ================================================================ */
-void FOC_CalibStep(FOC_t *foc)
+void FOC_CalibStep(FOC_t *foc, uint32_t elapsed_ms)
 {
+    uint32_t ramp_up_ms = MOTOR_ALIGNMENT_RAMP_UP_MS;
+    uint32_t hold_ms = MOTOR_ALIGNMENT_HOLD_MS;
+    uint32_t ramp_down_ms = MOTOR_ALIGNMENT_RAMP_DOWN_MS;
+    float voltage_scale;
+
     foc->elec_angle = 0.0f;
     foc->Uq = 0.0f;
-    foc->Ud = MOTOR_ALIGNMENT_VOLTAGE_V;
+
+    if (elapsed_ms < ramp_up_ms)
+    {
+        voltage_scale = (float)elapsed_ms / (float)ramp_up_ms;
+    }
+    else if (elapsed_ms < (ramp_up_ms + hold_ms))
+    {
+        voltage_scale = 1.0f;
+    }
+    else
+    {
+        uint32_t ramp_down_count = elapsed_ms - ramp_up_ms - hold_ms;
+        voltage_scale = (ramp_down_count >= ramp_down_ms)
+            ? 0.0f
+            : 1.0f - ((float)ramp_down_count / (float)ramp_down_ms);
+    }
+
+    foc->Ud = MOTOR_ALIGNMENT_VOLTAGE_V * voltage_scale;
+}
+
+/* ================================================================
+ *  FOC_S2DirectionStep —— S2 低压开环方向扫动
+ *
+ *  先把转子温和拉到已知电角度 0，再把定子电压矢量正向扫过一小段
+ *  电角度并原路返回。该过程不读取 PID 输出，也不保存任何校准值；
+ *  它只为用 AS5600 的实际角度变化确认相序与传感器方向关系。
+ * ================================================================ */
+void FOC_S2DirectionStep(FOC_t *foc, uint32_t elapsed_ms)
+{
+    const uint32_t align_end = MOTOR_S2_ALIGN_RAMP_UP_MS;
+    const uint32_t align_hold_end = align_end + MOTOR_S2_ALIGN_HOLD_MS;
+    const uint32_t sweep_forward_end = align_hold_end + MOTOR_S2_SWEEP_FORWARD_MS;
+    const uint32_t sweep_hold_end = sweep_forward_end + MOTOR_S2_SWEEP_HOLD_MS;
+    const uint32_t sweep_return_end = sweep_hold_end + MOTOR_S2_SWEEP_RETURN_MS;
+    const uint32_t ramp_down_end = sweep_return_end + MOTOR_S2_RAMP_DOWN_MS;
+    float vector_angle = 0.0f;
+    float voltage_scale = 0.0f;
+
+    if (elapsed_ms < align_end)
+    {
+        voltage_scale = (float)elapsed_ms / (float)MOTOR_S2_ALIGN_RAMP_UP_MS;
+    }
+    else if (elapsed_ms < align_hold_end)
+    {
+        voltage_scale = 1.0f;
+    }
+    else if (elapsed_ms < sweep_forward_end)
+    {
+        voltage_scale = 1.0f;
+        vector_angle = MOTOR_S2_ELEC_SWEEP_DEG
+            * (float)(elapsed_ms - align_hold_end)
+            / (float)MOTOR_S2_SWEEP_FORWARD_MS;
+    }
+    else if (elapsed_ms < sweep_hold_end)
+    {
+        voltage_scale = 1.0f;
+        vector_angle = MOTOR_S2_ELEC_SWEEP_DEG;
+    }
+    else if (elapsed_ms < sweep_return_end)
+    {
+        voltage_scale = 1.0f;
+        vector_angle = MOTOR_S2_ELEC_SWEEP_DEG
+            * (1.0f - (float)(elapsed_ms - sweep_hold_end)
+                         / (float)MOTOR_S2_SWEEP_RETURN_MS);
+    }
+    else if (elapsed_ms < ramp_down_end)
+    {
+        voltage_scale = 1.0f - (float)(elapsed_ms - sweep_return_end)
+                                  / (float)MOTOR_S2_RAMP_DOWN_MS;
+    }
+    else
+    {
+        foc->Ud = 0.0f;
+        foc->Uq = 0.0f;
+        foc->calib_flag = 0U;
+        foc->calib_start_ms = 0U;
+        foc->calib_result_ready = 1U;
+        return;
+    }
+
+    foc->elec_angle = vector_angle;
+    foc->Ud = MOTOR_S2_VOLTAGE_V * voltage_scale;
+    foc->Uq = 0.0f;
+}
+
+void FOC_S3HoldReset(FOC_t *foc)
+{
+    foc->s3_hold_uq = 0.0f;
+    foc->Ud = 0.0f;
+    foc->Uq = 0.0f;
+}
+
+void FOC_S3HoldStep(FOC_t *foc, float target_angle)
+{
+    float error = ANGLE_limit(target_angle - foc->mech_angle,
+                              360.0f, -180.0f, 180.0f);
+    float desired = 0.0f;
+    float max_delta;
+
+    /* A small deadband prevents encoder quantisation from chattering the
+       bridge when the rotor is already at the captured angle. */
+    if (error > MOTOR_S3_HOLD_DEADBAND_DEG
+        || error < -MOTOR_S3_HOLD_DEADBAND_DEG)
+    {
+        desired = MOTOR_S3_HOLD_KP_V_PER_DEG * error;
+        desired = DATA_limit(desired,
+                             -MOTOR_S3_HOLD_MAX_VOLTAGE_V,
+                             MOTOR_S3_HOLD_MAX_VOLTAGE_V);
+    }
+
+    max_delta = MOTOR_S3_HOLD_SLEW_V_PER_S / foc->rate;
+    if (foc->s3_hold_uq < desired - max_delta)
+    {
+        foc->s3_hold_uq += max_delta;
+    }
+    else if (foc->s3_hold_uq > desired + max_delta)
+    {
+        foc->s3_hold_uq -= max_delta;
+    }
+    else
+    {
+        foc->s3_hold_uq = desired;
+    }
+
+    foc->Ud = 0.0f;
+    foc->Uq = DATA_limit(foc->s3_hold_uq,
+                         -MOTOR_S3_HOLD_MAX_VOLTAGE_V,
+                         MOTOR_S3_HOLD_MAX_VOLTAGE_V);
+}
+
+uint8_t FOC_CommitCalibration(FOC_t *foc)
+{
+    FocCalibrationRecord_t record;
+    FocCalibrationRecord_t verify;
+
+    if (foc->calib_result_ready == 0U
+        || foc->calib_candidate_captured == 0U)
+    {
+        return 0U;
+    }
+
+    record.version = FOC_CALIBRATION_RECORD_VERSION;
+    record.elec_offset = ANGLE_limit(foc->calib_offset_candidate,
+                                     (float)foc->pole_pairs * 360.0f,
+                                     0.0f,
+                                     (float)foc->pole_pairs * 360.0f);
+    record.pole_pairs = foc->pole_pairs;
+    record.sensor_direction = foc->dir;
+    record.reserved = 0U;
+    record.checksum = FOC_CalibrationChecksum(&record);
+
+    foc->storage->write(foc->storage->ctx, &record, sizeof(record));
+    if (!foc->storage->read(foc->storage->ctx, &verify, sizeof(verify))
+        || !FOC_IsCalibrationRecordValid(foc, &verify))
+    {
+        return 0U;
+    }
+
+    foc->elec_offset = verify.elec_offset;
+    return 1U;
 }
 
 /* ================================================================

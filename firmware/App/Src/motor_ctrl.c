@@ -25,8 +25,23 @@
 #include "drv_tim.h"
 #include "led_indicator.h"
 #include "main.h"
+#include "angle_as5600.h"
+#include "smartknob_ctrl.h"
 
 /* SPEED_LIMIT_RPM 定义于 motor_config.h —— 所有模块共享 */
+
+static uint8_t Motor_SensorReady(void)
+{
+    return AS5600_IsHealthy(AS5600_HEALTH_MIN_SAMPLES,
+                            AS5600_MAX_SAMPLE_AGE_MS);
+}
+
+static uint8_t g_reset_one_shot_armed = 0U;
+
+void Motor_SetResetOneShotArmed(uint8_t armed)
+{
+    g_reset_one_shot_armed = (armed != 0U) ? 1U : 0U;
+}
 
 #if MOTOR_AUTORUN_DEMO
 typedef enum {
@@ -84,18 +99,13 @@ static void Motor_RunDemo(void)
         break;
 
     case DEMO_ALIGN:
-        /* FOC_Output performs the low-voltage alignment and clears this flag. */
+        /* V2 never promotes an automatic alignment into motion or a Flash
+           write. The candidate remains in RAM for explicit later validation. */
         if (Motor.calib_flag == 0U)
         {
-            Motor.storage->write(Motor.storage->ctx,
-                                 &Motor.elec_offset,
-                                 sizeof(Motor.elec_offset));
-            target_deg = Motor.mech_angle;
-            FOC_SetTarget(&Motor, target_deg);
-            LED_SetPattern(LED_PATTERN_ON);
-            RESET_TRAJECTORY_SPEED_LOOP();
-            state_ms = 0U;
-            state = DEMO_FORWARD;
+            FOC_Disable(&Motor);
+            LED_SetPattern(LED_PATTERN_HEARTBEAT);
+            state = DEMO_COMPLETE;
         }
         break;
 
@@ -233,12 +243,201 @@ void Motor_Loop(void)
     static MotorMode_t   g_mode     = MOTOR_MODE_STANDBY;    /**< 当前运行模式 */
     static uint16_t      g_comms_timeout = 0;                /**< 通信超时计数器 */
     static float         g_speed_desired = 0.0f;             /**< 速度指令目标（rpm），target_speed 斜坡逼近 */
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+    static uint32_t      test_loop_ready_ms = 0U;
+    static uint32_t      test_powered_start_ms = 0U;
+    static uint8_t       test_start_attempted = 0U;
+    static uint8_t       test_powered_window_active = 0U;
+#if MOTOR_S3_HOLD_ONE_SHOT
+    static uint8_t       s3_hold_active = 0U;
+    static float         s3_hold_target_angle = 0.0f;
+#endif
+#if MOTOR_S3B_STEP_ONE_SHOT
+    static uint8_t       s3b_active = 0U;
+    static float         s3b_base_angle = 0.0f;
+#endif
+#if MOTOR_SMARTKNOB_ENABLED
+    static uint8_t       smartknob_active = 0U;
+    static SmartKnob_t   smartknob;
+#endif
+#endif
 
     MotorCommand_t       cmd;
     uint8_t              new_cmd    = MotorMsg_PollCommand(&cmd);
 
     /* 喂独立看门狗 —— 如果此处卡死，IWDG ~2s 后自动复位 MCU */
     IWDG_REFRESH();      /* 喂独立看门狗 —— IWDG 寄存器直接操作 */
+
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+    /*
+     * Dedicated bounded test path: give the logic analyzer one second of
+     * PB1-low/I2C-only baseline, then make at most one health-gated attempt.
+     * A failed health check is a terminal safe standby for this reset cycle;
+     * it must never become an unexpected delayed motor start.
+     */
+    if (test_loop_ready_ms == 0U)
+    {
+        test_loop_ready_ms = HAL_GetTick();
+    }
+    else if (g_reset_one_shot_armed != 0U
+             && test_start_attempted == 0U
+             && (uint32_t)(HAL_GetTick() - test_loop_ready_ms)
+                    >= MOTOR_TEST_RESET_DELAY_MS)
+    {
+        test_start_attempted = 1U;
+        if (Motor_SensorReady()
+#if MOTOR_S3_HOLD_ONE_SHOT || MOTOR_S3B_STEP_ONE_SHOT || MOTOR_SMARTKNOB_ENABLED
+            && FOC_IsCalibrationValid(&Motor)
+#endif
+           )
+        {
+#if MOTOR_SMARTKNOB_ENABLED
+            SmartKnobConfig_t smartknob_config = {
+                MOTOR_SMARTKNOB_SPACING_DEG,
+                MOTOR_SMARTKNOB_STRENGTH_V_PER_DEG,
+                MOTOR_SMARTKNOB_DAMPING_V_PER_RPM,
+                MOTOR_SMARTKNOB_MAX_UQ_V,
+                MOTOR_SMARTKNOB_MAX_SPEED_RPM
+            };
+            SmartKnob_Init(&smartknob);
+            SmartKnob_SetConfig(&smartknob, &smartknob_config);
+            SmartKnob_SetEnabled(&smartknob, 1U);
+#elif MOTOR_S3B_STEP_ONE_SHOT
+            s3b_base_angle = Motor.mech_angle;
+            FOC_S3HoldReset(&Motor);
+#elif MOTOR_S3_HOLD_ONE_SHOT
+            /* Lock the filtered present angle before enabling the bridge. */
+            s3_hold_target_angle = Motor.mech_angle;
+            FOC_S3HoldReset(&Motor);
+#endif
+            FOC_Enable(&Motor);
+#if MOTOR_SMARTKNOB_ENABLED
+            smartknob_active = 1U;
+#elif MOTOR_S3B_STEP_ONE_SHOT
+            s3b_active = 1U;
+#elif MOTOR_S3_HOLD_ONE_SHOT
+            s3_hold_active = 1U;
+#else
+            Motor.calib_flag = MOTOR_TEST_CALIB_FLAG;
+            Motor.calib_count = 0U;
+            Motor.calib_start_ms = 0U;
+            Motor.calib_candidate_captured = 0U;
+            Motor.calib_result_ready = 0U;
+#endif
+            test_powered_start_ms = HAL_GetTick();
+            test_powered_window_active = 1U;
+#if MOTOR_S3_HOLD_ONE_SHOT || MOTOR_S3B_STEP_ONE_SHOT || MOTOR_SMARTKNOB_ENABLED
+            /* S3A uses its dedicated low-voltage controller below. */
+#else
+            g_mode = MOTOR_MODE_CALIBRATE;
+#endif
+            LED_SetPattern(LED_PATTERN_FAST_BLINK);
+        }
+    }
+#endif
+
+#if MOTOR_SMARTKNOB_ENABLED
+    if (smartknob_active != 0U)
+    {
+        float dt_s = (Motor.rate > 0.0f) ? (1.0f / Motor.rate) : 0.001f;
+
+        FOC_UpdateSensor(&Motor);
+        FOC_ReadCurrents(&Motor);
+
+        if (!Motor_SensorReady()
+            || (uint32_t)(HAL_GetTick() - test_powered_start_ms)
+                   >= MOTOR_SMARTKNOB_MAX_POWERED_MS)
+        {
+            SmartKnob_SetEnabled(&smartknob, 0U);
+            FOC_Disable(&Motor);
+            smartknob_active = 0U;
+            test_powered_window_active = 0U;
+            LED_SetPattern(LED_PATTERN_HEARTBEAT);
+        }
+        else
+        {
+            Motor.Ud = 0.0f;
+            Motor.Uq = SmartKnob_Update(&smartknob,
+                                        Motor.mech_angle,
+                                        Motor.speed,
+                                        dt_s);
+            FOC_Output(&Motor);
+        }
+
+        MotorMsg_UpdateStatus(Motor.mech_angle * DEG_TO_RAD,
+                              Motor.speed * RPM_TO_RAD_S,
+                              Motor.Uq);
+#if MOTOR_COMMUNICATION_ENABLED
+        MotorMsg_TxStatus();
+#endif
+        return;
+    }
+#elif MOTOR_S3B_STEP_ONE_SHOT
+    if (s3b_active != 0U)
+    {
+        uint32_t elapsed_ms;
+        float target_angle;
+
+        FOC_UpdateSensor(&Motor);
+        FOC_ReadCurrents(&Motor);
+        elapsed_ms = (uint32_t)(HAL_GetTick() - test_powered_start_ms);
+
+        if (!Motor_SensorReady() || elapsed_ms >= MOTOR_S3B_MAX_POWERED_MS)
+        {
+            FOC_Disable(&Motor);
+            s3b_active = 0U;
+            test_powered_window_active = 0U;
+            LED_SetPattern(LED_PATTERN_HEARTBEAT);
+        }
+        else
+        {
+            target_angle = (elapsed_ms < MOTOR_S3B_PRESTEP_HOLD_MS)
+                ? s3b_base_angle
+                : ANGLE_limit(s3b_base_angle + MOTOR_S3B_STEP_DEG,
+                              360.0f, 0.0f, 360.0f);
+            FOC_S3HoldStep(&Motor, target_angle);
+            FOC_Output(&Motor);
+        }
+
+        MotorMsg_UpdateStatus(Motor.mech_angle * DEG_TO_RAD,
+                              Motor.speed * RPM_TO_RAD_S,
+                              Motor.Uq);
+#if MOTOR_COMMUNICATION_ENABLED
+        MotorMsg_TxStatus();
+#endif
+        return;
+    }
+#elif MOTOR_S3_HOLD_ONE_SHOT
+    if (s3_hold_active != 0U)
+    {
+        FOC_UpdateSensor(&Motor);
+        FOC_ReadCurrents(&Motor);
+
+        if (!Motor_SensorReady()
+            || (uint32_t)(HAL_GetTick() - test_powered_start_ms)
+                   >= MOTOR_S3_HOLD_MAX_POWERED_MS)
+        {
+            /* Any health failure or timeout is an immediate hard stop. */
+            FOC_Disable(&Motor);
+            s3_hold_active = 0U;
+            test_powered_window_active = 0U;
+            LED_SetPattern(LED_PATTERN_HEARTBEAT);
+        }
+        else
+        {
+            FOC_S3HoldStep(&Motor, s3_hold_target_angle);
+            FOC_Output(&Motor);
+        }
+
+        MotorMsg_UpdateStatus(Motor.mech_angle * DEG_TO_RAD,
+                              Motor.speed * RPM_TO_RAD_S,
+                              Motor.Uq);
+#if MOTOR_COMMUNICATION_ENABLED
+        MotorMsg_TxStatus();
+#endif
+        return;
+    }
+#endif
 
 #if MOTOR_AUTORUN_DEMO
     /* Autonomous virtual/bench trajectory. Communication commands are
@@ -250,7 +449,9 @@ void Motor_Loop(void)
     MotorMsg_UpdateStatus(Motor.mech_angle * DEG_TO_RAD,
                           Motor.speed * RPM_TO_RAD_S,
                           Motor.Uq);
+#if MOTOR_COMMUNICATION_ENABLED
     MotorMsg_TxStatus();
+#endif
     return;
 #endif
 
@@ -263,6 +464,27 @@ void Motor_Loop(void)
     if (new_cmd)
     {
         g_comms_timeout = 0;    /* 收到新指令 → 复位通信超时 */
+
+#if MOTOR_S1_ALIGNMENT_ONLY
+        /* S1 accepts only a deliberate one-shot calibration request or an
+           immediate standby abort. No position, speed or torque command may
+           energize the bridge during the alignment-only stage. */
+        if (cmd.mode != MOTOR_MODE_STANDBY
+            && cmd.mode != MOTOR_MODE_CALIBRATE)
+        {
+            cmd.mode = MOTOR_MODE_STANDBY;
+        }
+#endif
+
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+        /* During the reset-triggered capture build, only STANDBY remains an
+           accepted external action.  CALIBRATE must not bypass the 1-second
+           baseline or create a second powered attempt. */
+        if (cmd.mode != MOTOR_MODE_STANDBY)
+        {
+            cmd.mode = MOTOR_MODE_STANDBY;
+        }
+#endif
 
         /* ---- 校准中收到待机：中止校准 ---- */
         if (g_mode == MOTOR_MODE_CALIBRATE && cmd.mode == MOTOR_MODE_STANDBY)
@@ -289,9 +511,19 @@ void Motor_Loop(void)
             }
             else if (cmd.mode != MOTOR_MODE_STANDBY && g_mode == MOTOR_MODE_STANDBY)
             {
-                /* 从待机恢复时，从当前实际转速起步（避免斜坡从旧值起跑） */
-                Motor.target_speed = Motor.speed;
-                FOC_Enable(&Motor);
+                if (!Motor_SensorReady())
+                {
+                    /* Recent encoder data is a prerequisite for PB1 enable. */
+                    FOC_Disable(&Motor);
+                    LED_SetPattern(LED_PATTERN_HEARTBEAT);
+                    cmd.mode = MOTOR_MODE_STANDBY;
+                }
+                else
+                {
+                    /* 从待机恢复时，从当前实际转速起步（避免斜坡从旧值起跑） */
+                    Motor.target_speed = Motor.speed;
+                    FOC_Enable(&Motor);
+                }
             }
 
             g_mode = cmd.mode;
@@ -314,10 +546,22 @@ void Motor_Loop(void)
                 break;
 
             case MOTOR_MODE_CALIBRATE:
-                /* 启动自校准：注入 Ud=4V 拉转子到 d 轴对齐 */
-                Motor.calib_flag  = 1;
-                Motor.calib_count = 0;
+#if MOTOR_POWER_STAGE_ENABLED
+                /* V2 only creates an in-memory candidate after a low-voltage
+                   ramp. It never writes Flash automatically. */
+                Motor.calib_flag = 1U;
+                Motor.calib_count = 0U;
+                Motor.calib_start_ms = 0U;
+                Motor.calib_candidate_captured = 0U;
+                Motor.calib_result_ready = 0U;
                 LED_SetPattern(LED_PATTERN_FAST_BLINK);
+#else
+                /* The safe default build does not simulate a successful
+                   calibration when the bridge is compiled out. */
+                FOC_Disable(&Motor);
+                g_mode = MOTOR_MODE_STANDBY;
+                LED_SetPattern(LED_PATTERN_HEARTBEAT);
+#endif
                 break;
 
             default:
@@ -355,6 +599,34 @@ void Motor_Loop(void)
     FOC_UpdateSensor(&Motor);
     FOC_ReadCurrents(&Motor);       /* 读三相电流 → Clarke → Park → Id/Iq */
 
+    if (g_mode != MOTOR_MODE_STANDBY && !Motor_SensorReady())
+    {
+        /* Loss of recent encoder samples while active is an immediate stop. */
+        FOC_Disable(&Motor);
+        g_mode = MOTOR_MODE_STANDBY;
+        g_speed_desired = 0.0f;
+        Motor.target_speed = 0.0f;
+        Motor.calib_flag = 0U;
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+        test_powered_window_active = 0U;
+#endif
+        LED_SetPattern(LED_PATTERN_HEARTBEAT);
+    }
+
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+    /* A second, independent exit guard for the one-shot S1-C build. */
+    if (test_powered_window_active != 0U
+        && (uint32_t)(HAL_GetTick() - test_powered_start_ms)
+               >= MOTOR_TEST_MAX_POWERED_MS)
+    {
+        FOC_Disable(&Motor);
+        Motor.calib_flag = 0U;
+        g_mode = MOTOR_MODE_STANDBY;
+        test_powered_window_active = 0U;
+        LED_SetPattern(LED_PATTERN_HEARTBEAT);
+    }
+#endif
+
     switch (g_mode)
     {
     case MOTOR_MODE_STANDBY:
@@ -382,7 +654,7 @@ void Motor_Loop(void)
         break;
 
     case MOTOR_MODE_CALIBRATE:
-        /* 跳过控制环 —— FOC_Output 内部的 calib_flag 会自动注入 Ud=4V */
+        /* FOC_Output injects only the configured low-voltage ramp. */
         break;
 
     default:
@@ -422,22 +694,24 @@ void Motor_Loop(void)
     /* ================================================================
      *  第 3 步：校准完成检测
      *
-     *  FOC_Output 中 calib_count 达到配置时长后自动清零 calib_flag，
-     *  并将当前 pole_pairs × mech_angle 写入 elec_offset。
-     *  此处检测到 flag 清零 → 写入 Flash → 恢复 LED → 关断 → 回待机。
+     *  V2 对齐完成时只保留内存中的候选偏移值。方向、相序和极对数
+     *  还未验证，因此严禁在此阶段自动写入 Flash。
      * ================================================================ */
-    if (g_mode == MOTOR_MODE_CALIBRATE && Motor.calib_flag == 0)
+    if (g_mode == MOTOR_MODE_CALIBRATE && Motor.calib_result_ready != 0U)
     {
-        /* 写入非易失存储永久保存 */
-        Motor.storage->write(Motor.storage->ctx,
-                             &Motor.elec_offset,
-                             sizeof(Motor.elec_offset));
-
         LED_SetPattern(LED_PATTERN_HEARTBEAT);
 
-        /* 关断驱动 → 回到待机 */
+        /* 关断驱动 → 回到待机；候选值供下一阶段显式确认。 */
         FOC_Disable(&Motor);
         g_mode = MOTOR_MODE_STANDBY;
+#if MOTOR_OPEN_LOOP_TEST_ACTIVE
+        test_powered_window_active = 0U;
+#endif
+#if MOTOR_TEST_COMMIT_OFFSET
+        /* The bridge is already disabled. Commit only this fully verified
+           one-shot candidate, then re-read it inside FOC_CommitCalibration. */
+        (void)FOC_CommitCalibration(&Motor);
+#endif
     }
 
     /* ================================================================
@@ -452,5 +726,7 @@ void Motor_Loop(void)
         Motor.speed * RPM_TO_RAD_S,
         Motor.Uq
     );
+#if MOTOR_COMMUNICATION_ENABLED
     MotorMsg_TxStatus();
+#endif
 }

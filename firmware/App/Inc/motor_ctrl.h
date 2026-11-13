@@ -21,6 +21,9 @@
 #ifndef __MOTOR_CTRL_H__
 #define __MOTOR_CTRL_H__
 
+#include <stdint.h>
+
 void Motor_Loop(void);
+void Motor_SetResetOneShotArmed(uint8_t armed);
 
 #endif

@@ -12,7 +12,7 @@ SRCS := \
   Core/Src/main.c Core/Src/adc.c Core/Src/can.c Core/Src/dma.c Core/Src/gpio.c \
   Core/Src/i2c.c Core/Src/stm32f1xx_hal_msp.c Core/Src/stm32f1xx_it.c \
   Core/Src/system_stm32f1xx.c Core/Src/tim.c Core/Src/usart.c \
-  App/Src/Foc.c App/Src/can_proto.c App/Src/motor_ctrl.c App/Src/motor_msg.c App/Src/uart_proto.c \
+  App/Src/Foc.c App/Src/can_proto.c App/Src/motor_ctrl.c App/Src/motor_msg.c App/Src/smartknob_ctrl.c App/Src/uart_proto.c \
   Bsp/Src/angle_as5600.c Bsp/Src/flash_storage.c Bsp/Src/pwm_3phase.c \
   Drv/Src/drv_adc.c Drv/Src/drv_can.c Drv/Src/drv_tim.c Drv/Src/led_indicator.c \
   Lib/Src/data_process.c Lib/Src/foc_math.c Lib/Src/observer_diff.c Lib/Src/observer_luenberger.c Lib/Src/pid.c \

@@ -28,6 +28,7 @@ volatile uint32_t g_as5600_poll_ok = 0U;
 volatile uint32_t g_as5600_poll_error = 0U;
 volatile uint32_t g_as5600_last_error = 0U;
 volatile uint16_t g_as5600_last_raw = 0U;
+volatile uint32_t g_as5600_last_success_ms = 0U;
 
 /**
  * @brief  读取原始 ADC 值（0 ~ 4095）
@@ -74,6 +75,22 @@ void AS5600_Poll(I2C_HandleTypeDef *hi2c)
     g_as5600_poll_ok++;
     g_as5600_last_raw = raw;
     s_last_angle = (float)raw * (360.0f / 4096.0f);
+    g_as5600_last_success_ms = HAL_GetTick();
+}
+
+uint8_t AS5600_IsHealthy(uint32_t min_success_samples,
+                         uint32_t max_sample_age_ms)
+{
+    uint32_t last_success_ms = g_as5600_last_success_ms;
+
+    if ((g_as5600_poll_ok < min_success_samples) || (last_success_ms == 0U))
+    {
+        return 0U;
+    }
+
+    return ((uint32_t)(HAL_GetTick() - last_success_ms) <= max_sample_age_ms)
+        ? 1U
+        : 0U;
 }
 
 float AS5600_ReadAngle(void *ctx)
