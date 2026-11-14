@@ -14,6 +14,11 @@
 #define SMARTKNOB_DEFAULT_MAX_DAMPING_V    0.24f
 #define SMARTKNOB_DEFAULT_SPRING_NONLINEAR_GAIN 0.0f
 #define SMARTKNOB_DEFAULT_STARTUP_RAMP_S  0.25f
+#define SMARTKNOB_DEFAULT_OSC_WINDOW_S    0.35f
+#define SMARTKNOB_DEFAULT_OSC_MIN_SWING_DEG 1.5f
+#define SMARTKNOB_DEFAULT_OSC_CAPTURE_MAX_UQ_V 0.45f
+#define SMARTKNOB_DEFAULT_OSC_CAPTURE_RAMP_S 0.20f
+#define SMARTKNOB_DEFAULT_OSC_CAPTURE_RELEASE_DEG 9.0f
 #define SMARTKNOB_DEFAULT_MAX_UQ_V           0.80f
 #define SMARTKNOB_DEFAULT_MAX_SPEED_RPM      60.0f
 #define SMARTKNOB_HARD_MAX_UQ_V              0.80f
@@ -84,6 +89,21 @@ static void sanitize_config(SmartKnobConfig_t *config)
     if (config->startup_ramp_s < 0.0f) {
         config->startup_ramp_s = 0.0f;
     }
+    if (config->oscillation_window_s < 0.0f) {
+        config->oscillation_window_s = 0.0f;
+    }
+    if (config->oscillation_min_swing_deg < 0.0f) {
+        config->oscillation_min_swing_deg = 0.0f;
+    }
+    if (config->oscillation_capture_max_uq_v < 0.0f) {
+        config->oscillation_capture_max_uq_v = 0.0f;
+    }
+    if (config->oscillation_capture_ramp_s < 0.0f) {
+        config->oscillation_capture_ramp_s = 0.0f;
+    }
+    if (config->oscillation_capture_release_deg < 0.0f) {
+        config->oscillation_capture_release_deg = 0.0f;
+    }
     if (config->max_uq_v < 0.0f) {
         config->max_uq_v = 0.0f;
     }
@@ -109,6 +129,11 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->config.max_damping_v = SMARTKNOB_DEFAULT_MAX_DAMPING_V;
     knob->config.spring_nonlinear_gain = SMARTKNOB_DEFAULT_SPRING_NONLINEAR_GAIN;
     knob->config.startup_ramp_s = SMARTKNOB_DEFAULT_STARTUP_RAMP_S;
+    knob->config.oscillation_window_s = SMARTKNOB_DEFAULT_OSC_WINDOW_S;
+    knob->config.oscillation_min_swing_deg = SMARTKNOB_DEFAULT_OSC_MIN_SWING_DEG;
+    knob->config.oscillation_capture_max_uq_v = SMARTKNOB_DEFAULT_OSC_CAPTURE_MAX_UQ_V;
+    knob->config.oscillation_capture_ramp_s = SMARTKNOB_DEFAULT_OSC_CAPTURE_RAMP_S;
+    knob->config.oscillation_capture_release_deg = SMARTKNOB_DEFAULT_OSC_CAPTURE_RELEASE_DEG;
     knob->config.max_uq_v = SMARTKNOB_DEFAULT_MAX_UQ_V;
     knob->config.max_speed_rpm = SMARTKNOB_DEFAULT_MAX_SPEED_RPM;
     knob->target_angle_deg = 0.0f;
@@ -117,6 +142,15 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->enabled = 0U;
     knob->initialized = 1U;
     knob->startup_elapsed_s = 0.0f;
+    knob->last_angle_deg = 0.0f;
+    knob->swing_since_reversal_deg = 0.0f;
+    knob->oscillation_elapsed_s = 0.0f;
+    knob->oscillation_capture_elapsed_s = 0.0f;
+    knob->oscillation_capture_target_deg = 0.0f;
+    knob->motion_direction = 0;
+    knob->oscillation_reversals = 0U;
+    knob->oscillation_capture_active = 0U;
+    knob->motion_initialized = 0U;
 }
 
 void SmartKnob_SetConfig(SmartKnob_t *knob, const SmartKnobConfig_t *config)
@@ -143,11 +177,21 @@ void SmartKnob_SetEnabled(SmartKnob_t *knob, uint8_t enabled)
     }
     if ((enabled != 0U) && (knob->enabled == 0U)) {
         knob->startup_elapsed_s = 0.0f;
+        knob->oscillation_elapsed_s = 0.0f;
+        knob->oscillation_capture_elapsed_s = 0.0f;
+        knob->oscillation_reversals = 0U;
+        knob->oscillation_capture_active = 0U;
+        knob->motion_initialized = 0U;
     }
     knob->enabled = (enabled != 0U) ? 1U : 0U;
     if (knob->enabled == 0U) {
         knob->output_uq_v = 0.0f;
         knob->startup_elapsed_s = 0.0f;
+        knob->oscillation_elapsed_s = 0.0f;
+        knob->oscillation_capture_elapsed_s = 0.0f;
+        knob->oscillation_reversals = 0U;
+        knob->oscillation_capture_active = 0U;
+        knob->motion_initialized = 0U;
     }
 }
 
@@ -169,6 +213,11 @@ float SmartKnob_Update(SmartKnob_t *knob,
     float damping_command;
     float spring;
     float startup_scale;
+    float angle_delta;
+    float capture_error;
+    float capture_phase;
+    float capture_command;
+    float capture_scale;
 
     if (knob == 0) {
         return 0.0f;
@@ -192,6 +241,47 @@ float SmartKnob_Update(SmartKnob_t *knob,
         if (fabsf(current_error) > (spacing * SMARTKNOB_DETENT_HYSTERESIS)) {
             knob->detent_index = candidate;
             knob->target_angle_deg = candidate_target;
+        }
+    }
+
+    if (knob->motion_initialized == 0U) {
+        knob->last_angle_deg = angle;
+        knob->motion_initialized = 1U;
+    } else {
+        angle_delta = shortest_error_deg(angle, knob->last_angle_deg);
+        knob->last_angle_deg = angle;
+        knob->oscillation_elapsed_s += dt_s;
+        if ((knob->config.oscillation_window_s > 0.0f)
+            && (knob->oscillation_elapsed_s
+                > knob->config.oscillation_window_s)) {
+            knob->oscillation_elapsed_s = 0.0f;
+            knob->oscillation_reversals = 0U;
+            knob->swing_since_reversal_deg = 0.0f;
+            knob->motion_direction = 0;
+        }
+        if (fabsf(angle_delta) >= 0.15f) {
+            int8_t direction = (angle_delta > 0.0f) ? 1 : -1;
+            knob->swing_since_reversal_deg += fabsf(angle_delta);
+            if ((knob->motion_direction != 0)
+                && (direction != knob->motion_direction)
+                && (knob->swing_since_reversal_deg
+                    >= knob->config.oscillation_min_swing_deg)) {
+                knob->oscillation_reversals++;
+                knob->motion_direction = direction;
+                knob->swing_since_reversal_deg = 0.0f;
+            } else if (knob->motion_direction == 0) {
+                knob->motion_direction = direction;
+                knob->swing_since_reversal_deg = 0.0f;
+            }
+        }
+        if ((knob->oscillation_capture_active == 0U)
+            && (knob->oscillation_reversals >= 3U)) {
+            knob->oscillation_capture_target_deg = wrap_angle_deg(
+                (float)nearest_detent(angle, spacing) * spacing);
+            knob->oscillation_capture_active = 1U;
+            knob->oscillation_capture_elapsed_s = 0.0f;
+            knob->oscillation_reversals = 0U;
+            knob->oscillation_elapsed_s = 0.0f;
         }
     }
 
@@ -232,6 +322,31 @@ float SmartKnob_Update(SmartKnob_t *knob,
                         * tanhf(damping_command / knob->config.max_damping_v);
     }
     command -= damping_command;
+    if (knob->oscillation_capture_active != 0U) {
+        capture_error = shortest_error_deg(
+            knob->oscillation_capture_target_deg, angle);
+        if ((knob->oscillation_capture_elapsed_s
+             > knob->config.oscillation_capture_ramp_s)
+            && (fabsf(capture_error)
+                > knob->config.oscillation_capture_release_deg)
+            && (fabsf(speed_rpm) > 12.0f)) {
+            knob->oscillation_capture_active = 0U;
+        } else {
+            capture_phase = capture_error * (2.0f * 3.14159265359f) / spacing;
+            capture_command = detent_peak_v * sinf(capture_phase);
+            capture_command = clampf(capture_command,
+                                     -knob->config.oscillation_capture_max_uq_v,
+                                     knob->config.oscillation_capture_max_uq_v);
+            knob->oscillation_capture_elapsed_s += dt_s;
+            capture_scale = (knob->config.oscillation_capture_ramp_s > 0.0f)
+                          ? clampf(knob->oscillation_capture_elapsed_s
+                                   / knob->config.oscillation_capture_ramp_s,
+                                   0.0f, 1.0f)
+                          : 1.0f;
+            command = command * (1.0f - capture_scale)
+                    + capture_command * capture_scale;
+        }
+    }
     if (knob->config.startup_ramp_s > 0.0f) {
         knob->startup_elapsed_s += dt_s;
         startup_scale = clampf(knob->startup_elapsed_s

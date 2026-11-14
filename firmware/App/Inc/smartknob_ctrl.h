@@ -18,6 +18,11 @@ typedef struct
     float max_damping_v;            /**< 阻尼电压软上限 */
     float spring_nonlinear_gain;    /**< 偏离卡点后的非线性恢复增强 */
     float startup_ramp_s;           /**< 使能后的输出软启动时间 */
+    float oscillation_window_s;     /**< 反转计数时间窗 */
+    float oscillation_min_swing_deg; /**< 计为反转的最小摆幅 */
+    float oscillation_capture_max_uq_v; /**< 捕获阶段输出上限 */
+    float oscillation_capture_ramp_s; /**< 捕获输出平滑时间 */
+    float oscillation_capture_release_deg; /**< 解除锁定角度 */
     float max_uq_v;                 /**< 输出电压上限 */
     float max_speed_rpm;            /**< 参与阻尼计算的速度上限 */
 } SmartKnobConfig_t;
@@ -31,6 +36,15 @@ typedef struct
     uint8_t enabled;
     uint8_t initialized;
     float startup_elapsed_s;
+    float last_angle_deg;
+    float swing_since_reversal_deg;
+    float oscillation_elapsed_s;
+    float oscillation_capture_elapsed_s;
+    float oscillation_capture_target_deg;
+    int8_t motion_direction;
+    uint8_t oscillation_reversals;
+    uint8_t oscillation_capture_active;
+    uint8_t motion_initialized;
 } SmartKnob_t;
 
 void SmartKnob_Init(SmartKnob_t *knob);

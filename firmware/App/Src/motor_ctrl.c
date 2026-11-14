@@ -301,6 +301,11 @@ void Motor_Loop(void)
                 MOTOR_SMARTKNOB_MAX_DAMPING_V,
                 MOTOR_SMARTKNOB_SPRING_NONLINEAR_GAIN,
                 (float)MOTOR_SMARTKNOB_START_RAMP_MS / 1000.0f,
+                (float)MOTOR_SMARTKNOB_OSC_WINDOW_MS / 1000.0f,
+                MOTOR_SMARTKNOB_OSC_MIN_SWING_DEG,
+                MOTOR_SMARTKNOB_OSC_CAPTURE_MAX_UQ_V,
+                (float)MOTOR_SMARTKNOB_OSC_CAPTURE_RAMP_MS / 1000.0f,
+                MOTOR_SMARTKNOB_OSC_CAPTURE_RELEASE_DEG,
                 MOTOR_SMARTKNOB_MAX_UQ_V,
                 MOTOR_SMARTKNOB_MAX_SPEED_RPM
             };
