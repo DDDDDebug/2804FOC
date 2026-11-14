@@ -14,6 +14,10 @@ typedef struct
     float detent_strength_v_per_deg; /**< 连续卡点曲线增益 */
     float damping_v_per_rpm;        /**< 速度阻尼增益 */
     float detent_damping_v_per_rpm; /**< 卡点附近附加阻尼 */
+    float detent_damping_start_rpm; /**< 附加阻尼开始增强的速度 */
+    float max_damping_v;            /**< 阻尼电压软上限 */
+    float spring_nonlinear_gain;    /**< 偏离卡点后的非线性恢复增强 */
+    float startup_ramp_s;           /**< 使能后的输出软启动时间 */
     float max_uq_v;                 /**< 输出电压上限 */
     float max_speed_rpm;            /**< 参与阻尼计算的速度上限 */
 } SmartKnobConfig_t;
@@ -26,6 +30,7 @@ typedef struct
     int32_t detent_index;
     uint8_t enabled;
     uint8_t initialized;
+    float startup_elapsed_s;
 } SmartKnob_t;
 
 void SmartKnob_Init(SmartKnob_t *knob);

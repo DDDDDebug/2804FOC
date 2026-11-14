@@ -297,6 +297,10 @@ void Motor_Loop(void)
                 MOTOR_SMARTKNOB_STRENGTH_V_PER_DEG,
                 MOTOR_SMARTKNOB_DAMPING_V_PER_RPM,
                 MOTOR_SMARTKNOB_DETENT_DAMPING_V_PER_RPM,
+                MOTOR_SMARTKNOB_DETENT_DAMPING_START_RPM,
+                MOTOR_SMARTKNOB_MAX_DAMPING_V,
+                MOTOR_SMARTKNOB_SPRING_NONLINEAR_GAIN,
+                (float)MOTOR_SMARTKNOB_START_RAMP_MS / 1000.0f,
                 MOTOR_SMARTKNOB_MAX_UQ_V,
                 MOTOR_SMARTKNOB_MAX_SPEED_RPM
             };

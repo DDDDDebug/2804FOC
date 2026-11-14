@@ -10,6 +10,10 @@
 #define SMARTKNOB_DEFAULT_STRENGTH_V_PER_DEG 0.120f
 #define SMARTKNOB_DEFAULT_DAMPING_V_PER_RPM  0.002f
 #define SMARTKNOB_DEFAULT_DETENT_DAMPING_V_PER_RPM 0.012f
+#define SMARTKNOB_DEFAULT_DETENT_DAMPING_START_RPM 15.0f
+#define SMARTKNOB_DEFAULT_MAX_DAMPING_V    0.24f
+#define SMARTKNOB_DEFAULT_SPRING_NONLINEAR_GAIN 0.0f
+#define SMARTKNOB_DEFAULT_STARTUP_RAMP_S  0.25f
 #define SMARTKNOB_DEFAULT_MAX_UQ_V           0.80f
 #define SMARTKNOB_DEFAULT_MAX_SPEED_RPM      60.0f
 #define SMARTKNOB_HARD_MAX_UQ_V              0.80f
@@ -68,6 +72,18 @@ static void sanitize_config(SmartKnobConfig_t *config)
     if (config->detent_damping_v_per_rpm < 0.0f) {
         config->detent_damping_v_per_rpm = 0.0f;
     }
+    if (config->detent_damping_start_rpm < 0.0f) {
+        config->detent_damping_start_rpm = 0.0f;
+    }
+    if (config->max_damping_v < 0.0f) {
+        config->max_damping_v = 0.0f;
+    }
+    if (config->spring_nonlinear_gain < 0.0f) {
+        config->spring_nonlinear_gain = 0.0f;
+    }
+    if (config->startup_ramp_s < 0.0f) {
+        config->startup_ramp_s = 0.0f;
+    }
     if (config->max_uq_v < 0.0f) {
         config->max_uq_v = 0.0f;
     }
@@ -89,6 +105,10 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->config.detent_strength_v_per_deg = SMARTKNOB_DEFAULT_STRENGTH_V_PER_DEG;
     knob->config.damping_v_per_rpm = SMARTKNOB_DEFAULT_DAMPING_V_PER_RPM;
     knob->config.detent_damping_v_per_rpm = SMARTKNOB_DEFAULT_DETENT_DAMPING_V_PER_RPM;
+    knob->config.detent_damping_start_rpm = SMARTKNOB_DEFAULT_DETENT_DAMPING_START_RPM;
+    knob->config.max_damping_v = SMARTKNOB_DEFAULT_MAX_DAMPING_V;
+    knob->config.spring_nonlinear_gain = SMARTKNOB_DEFAULT_SPRING_NONLINEAR_GAIN;
+    knob->config.startup_ramp_s = SMARTKNOB_DEFAULT_STARTUP_RAMP_S;
     knob->config.max_uq_v = SMARTKNOB_DEFAULT_MAX_UQ_V;
     knob->config.max_speed_rpm = SMARTKNOB_DEFAULT_MAX_SPEED_RPM;
     knob->target_angle_deg = 0.0f;
@@ -96,6 +116,7 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->detent_index = 0;
     knob->enabled = 0U;
     knob->initialized = 1U;
+    knob->startup_elapsed_s = 0.0f;
 }
 
 void SmartKnob_SetConfig(SmartKnob_t *knob, const SmartKnobConfig_t *config)
@@ -120,9 +141,13 @@ void SmartKnob_SetEnabled(SmartKnob_t *knob, uint8_t enabled)
     if (knob->initialized == 0U) {
         SmartKnob_Init(knob);
     }
+    if ((enabled != 0U) && (knob->enabled == 0U)) {
+        knob->startup_elapsed_s = 0.0f;
+    }
     knob->enabled = (enabled != 0U) ? 1U : 0U;
     if (knob->enabled == 0U) {
         knob->output_uq_v = 0.0f;
+        knob->startup_elapsed_s = 0.0f;
     }
 }
 
@@ -139,10 +164,12 @@ float SmartKnob_Update(SmartKnob_t *knob,
     float command;
     float phase_rad;
     float detent_peak_v;
-    float proximity;
     float dynamic_damping;
+    float speed_gate;
+    float damping_command;
+    float spring;
+    float startup_scale;
 
-    (void)dt_s;
     if (knob == 0) {
         return 0.0f;
     }
@@ -176,12 +203,42 @@ float SmartKnob_Update(SmartKnob_t *knob,
     phase_rad = angle * (2.0f * 3.14159265359f) / spacing;
     detent_peak_v = knob->config.detent_strength_v_per_deg * spacing
                   / (2.0f * 3.14159265359f);
-    command = -detent_peak_v * sinf(phase_rad);
-    proximity = fabsf(cosf(phase_rad));
-    dynamic_damping = knob->config.damping_v_per_rpm
-                    + knob->config.detent_damping_v_per_rpm
-                    * proximity * proximity;
-    command -= dynamic_damping * speed;
+    spring = sinf(phase_rad);
+    spring += knob->config.spring_nonlinear_gain
+            * spring * spring * spring;
+    command = -detent_peak_v * spring;
+    if (knob->config.detent_damping_start_rpm > 0.0f) {
+        speed_gate = clampf(fabsf(speed)
+                            / knob->config.detent_damping_start_rpm,
+                            0.0f, 1.0f);
+        /* Smoothstep avoids a new force discontinuity at the threshold. */
+        speed_gate = speed_gate * speed_gate * (3.0f - 2.0f * speed_gate);
+    } else {
+        speed_gate = 1.0f;
+    }
+    {
+        float proximity = fabsf(cosf(phase_rad));
+        dynamic_damping = knob->config.damping_v_per_rpm;
+        if (knob->config.detent_damping_v_per_rpm > 0.0f) {
+            dynamic_damping += knob->config.detent_damping_v_per_rpm
+                             * proximity * proximity * speed_gate;
+        }
+    }
+    damping_command = dynamic_damping * speed;
+    if ((knob->config.detent_damping_v_per_rpm > 0.0f)
+        && (knob->config.max_damping_v > 0.0f)) {
+        /* Smoothly limit damping voltage to avoid a bang-bang limit cycle. */
+        damping_command = knob->config.max_damping_v
+                        * tanhf(damping_command / knob->config.max_damping_v);
+    }
+    command -= damping_command;
+    if (knob->config.startup_ramp_s > 0.0f) {
+        knob->startup_elapsed_s += dt_s;
+        startup_scale = clampf(knob->startup_elapsed_s
+                               / knob->config.startup_ramp_s,
+                               0.0f, 1.0f);
+        command *= startup_scale;
+    }
     knob->output_uq_v = clampf(command,
                                -knob->config.max_uq_v,
                                knob->config.max_uq_v);
