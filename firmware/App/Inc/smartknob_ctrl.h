@@ -12,6 +12,7 @@ typedef struct
 {
     float detent_spacing_deg;       /**< 机械角卡点间距 */
     float detent_strength_v_per_deg; /**< 连续卡点曲线增益 */
+    float spring_center_scale;      /**< 卡点中心斜率相对外沿峰值的比例 */
     float damping_v_per_rpm;        /**< 速度阻尼增益 */
     float detent_damping_v_per_rpm; /**< 卡点附近附加阻尼 */
     float detent_damping_start_rpm; /**< 附加阻尼开始增强的速度 */

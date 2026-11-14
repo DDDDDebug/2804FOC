@@ -295,6 +295,7 @@ void Motor_Loop(void)
             SmartKnobConfig_t smartknob_config = {
                 MOTOR_SMARTKNOB_SPACING_DEG,
                 MOTOR_SMARTKNOB_STRENGTH_V_PER_DEG,
+                MOTOR_SMARTKNOB_SPRING_CENTER_SCALE,
                 MOTOR_SMARTKNOB_DAMPING_V_PER_RPM,
                 MOTOR_SMARTKNOB_DETENT_DAMPING_V_PER_RPM,
                 MOTOR_SMARTKNOB_DETENT_DAMPING_START_RPM,
