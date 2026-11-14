@@ -8,7 +8,7 @@
 
 #define SMARTKNOB_DEFAULT_SPACING_DEG       30.0f
 #define SMARTKNOB_DEFAULT_STRENGTH_V_PER_DEG 0.180f
-#define SMARTKNOB_DEFAULT_SPRING_CENTER_SCALE 0.75f
+#define SMARTKNOB_DEFAULT_SPRING_CENTER_SCALE 0.67f
 #define SMARTKNOB_DEFAULT_DAMPING_V_PER_RPM  0.002f
 #define SMARTKNOB_DEFAULT_DETENT_DAMPING_V_PER_RPM 0.012f
 #define SMARTKNOB_DEFAULT_DETENT_DAMPING_START_RPM 15.0f
@@ -20,6 +20,13 @@
 #define SMARTKNOB_DEFAULT_OSC_CAPTURE_MAX_UQ_V 0.20f
 #define SMARTKNOB_DEFAULT_OSC_CAPTURE_RAMP_S 0.30f
 #define SMARTKNOB_DEFAULT_OSC_CAPTURE_RELEASE_DEG 9.0f
+#define SMARTKNOB_DEFAULT_MICRO_WINDOW_S 0.15f
+#define SMARTKNOB_DEFAULT_MICRO_MIN_SWING_DEG 1.0f
+#define SMARTKNOB_DEFAULT_MICRO_DAMPING_V_PER_RPM 0.006f
+#define SMARTKNOB_DEFAULT_MICRO_DAMPING_MAX_UQ_V 0.12f
+#define SMARTKNOB_DEFAULT_MICRO_DAMPING_RAMP_S 0.18f
+#define SMARTKNOB_DEFAULT_MICRO_DAMPING_ZONE_DEG 5.0f
+#define SMARTKNOB_DEFAULT_MICRO_DAMPING_RELEASE_DEG 6.0f
 #define SMARTKNOB_DEFAULT_MAX_UQ_V           0.90f
 #define SMARTKNOB_DEFAULT_MAX_SPEED_RPM      60.0f
 #define SMARTKNOB_HARD_MAX_UQ_V              1.00f
@@ -111,6 +118,28 @@ static void sanitize_config(SmartKnobConfig_t *config)
     if (config->oscillation_capture_release_deg < 0.0f) {
         config->oscillation_capture_release_deg = 0.0f;
     }
+    if (config->micro_oscillation_window_s < 0.0f) {
+        config->micro_oscillation_window_s = 0.0f;
+    }
+    if (config->micro_oscillation_min_swing_deg < 0.0f) {
+        config->micro_oscillation_min_swing_deg = 0.0f;
+    }
+    if (config->micro_damping_v_per_rpm < 0.0f) {
+        config->micro_damping_v_per_rpm = 0.0f;
+    }
+    if (config->micro_damping_max_uq_v < 0.0f) {
+        config->micro_damping_max_uq_v = 0.0f;
+    }
+    if (config->micro_damping_ramp_s < 0.0f) {
+        config->micro_damping_ramp_s = 0.0f;
+    }
+    if (config->micro_damping_zone_deg < 0.0f) {
+        config->micro_damping_zone_deg = 0.0f;
+    }
+    if (config->micro_damping_release_deg
+        < config->micro_damping_zone_deg) {
+        config->micro_damping_release_deg = config->micro_damping_zone_deg;
+    }
     if (config->max_uq_v < 0.0f) {
         config->max_uq_v = 0.0f;
     }
@@ -142,6 +171,13 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->config.oscillation_capture_max_uq_v = SMARTKNOB_DEFAULT_OSC_CAPTURE_MAX_UQ_V;
     knob->config.oscillation_capture_ramp_s = SMARTKNOB_DEFAULT_OSC_CAPTURE_RAMP_S;
     knob->config.oscillation_capture_release_deg = SMARTKNOB_DEFAULT_OSC_CAPTURE_RELEASE_DEG;
+    knob->config.micro_oscillation_window_s = SMARTKNOB_DEFAULT_MICRO_WINDOW_S;
+    knob->config.micro_oscillation_min_swing_deg = SMARTKNOB_DEFAULT_MICRO_MIN_SWING_DEG;
+    knob->config.micro_damping_v_per_rpm = SMARTKNOB_DEFAULT_MICRO_DAMPING_V_PER_RPM;
+    knob->config.micro_damping_max_uq_v = SMARTKNOB_DEFAULT_MICRO_DAMPING_MAX_UQ_V;
+    knob->config.micro_damping_ramp_s = SMARTKNOB_DEFAULT_MICRO_DAMPING_RAMP_S;
+    knob->config.micro_damping_zone_deg = SMARTKNOB_DEFAULT_MICRO_DAMPING_ZONE_DEG;
+    knob->config.micro_damping_release_deg = SMARTKNOB_DEFAULT_MICRO_DAMPING_RELEASE_DEG;
     knob->config.max_uq_v = SMARTKNOB_DEFAULT_MAX_UQ_V;
     knob->config.max_speed_rpm = SMARTKNOB_DEFAULT_MAX_SPEED_RPM;
     knob->target_angle_deg = 0.0f;
@@ -158,6 +194,12 @@ void SmartKnob_Init(SmartKnob_t *knob)
     knob->motion_direction = 0;
     knob->oscillation_reversals = 0U;
     knob->oscillation_capture_active = 0U;
+    knob->micro_swing_since_reversal_deg = 0.0f;
+    knob->micro_oscillation_elapsed_s = 0.0f;
+    knob->micro_damping_elapsed_s = 0.0f;
+    knob->micro_motion_direction = 0;
+    knob->micro_oscillation_reversals = 0U;
+    knob->micro_damping_active = 0U;
     knob->motion_initialized = 0U;
 }
 
@@ -189,6 +231,12 @@ void SmartKnob_SetEnabled(SmartKnob_t *knob, uint8_t enabled)
         knob->oscillation_capture_elapsed_s = 0.0f;
         knob->oscillation_reversals = 0U;
         knob->oscillation_capture_active = 0U;
+        knob->micro_swing_since_reversal_deg = 0.0f;
+        knob->micro_oscillation_elapsed_s = 0.0f;
+        knob->micro_damping_elapsed_s = 0.0f;
+        knob->micro_motion_direction = 0;
+        knob->micro_oscillation_reversals = 0U;
+        knob->micro_damping_active = 0U;
         knob->motion_initialized = 0U;
     }
     knob->enabled = (enabled != 0U) ? 1U : 0U;
@@ -199,6 +247,12 @@ void SmartKnob_SetEnabled(SmartKnob_t *knob, uint8_t enabled)
         knob->oscillation_capture_elapsed_s = 0.0f;
         knob->oscillation_reversals = 0U;
         knob->oscillation_capture_active = 0U;
+        knob->micro_swing_since_reversal_deg = 0.0f;
+        knob->micro_oscillation_elapsed_s = 0.0f;
+        knob->micro_damping_elapsed_s = 0.0f;
+        knob->micro_motion_direction = 0;
+        knob->micro_oscillation_reversals = 0U;
+        knob->micro_damping_active = 0U;
         knob->motion_initialized = 0U;
     }
 }
@@ -224,10 +278,13 @@ float SmartKnob_Update(SmartKnob_t *knob,
     float spring_shape;
     float startup_scale;
     float angle_delta;
+    float detent_error;
     float capture_error;
     float capture_phase;
     float capture_command;
     float capture_scale;
+    float micro_damping_command;
+    float micro_damping_scale;
 
     if (knob == 0) {
         return 0.0f;
@@ -253,6 +310,7 @@ float SmartKnob_Update(SmartKnob_t *knob,
             knob->target_angle_deg = candidate_target;
         }
     }
+    detent_error = shortest_error_deg(knob->target_angle_deg, angle);
 
     if (knob->motion_initialized == 0U) {
         knob->last_angle_deg = angle;
@@ -293,6 +351,52 @@ float SmartKnob_Update(SmartKnob_t *knob,
             knob->oscillation_reversals = 0U;
             knob->oscillation_elapsed_s = 0.0f;
         }
+
+        /* A separate, small-swing detector damps micro-jitter without
+           lowering the threshold of the stronger travel capture path. */
+        if (fabsf(detent_error)
+            > knob->config.micro_damping_release_deg) {
+            knob->micro_oscillation_elapsed_s = 0.0f;
+            knob->micro_oscillation_reversals = 0U;
+            knob->micro_swing_since_reversal_deg = 0.0f;
+            knob->micro_motion_direction = 0;
+            knob->micro_damping_active = 0U;
+            knob->micro_damping_elapsed_s = 0.0f;
+        } else {
+            knob->micro_oscillation_elapsed_s += dt_s;
+            if ((knob->config.micro_oscillation_window_s > 0.0f)
+                && (knob->micro_oscillation_elapsed_s
+                    > knob->config.micro_oscillation_window_s)) {
+                knob->micro_oscillation_elapsed_s = 0.0f;
+                knob->micro_oscillation_reversals = 0U;
+                knob->micro_swing_since_reversal_deg = 0.0f;
+                knob->micro_motion_direction = 0;
+            }
+            if (fabsf(angle_delta) >= 0.15f) {
+                int8_t micro_direction = (angle_delta > 0.0f) ? 1 : -1;
+                knob->micro_swing_since_reversal_deg += fabsf(angle_delta);
+                if ((knob->micro_motion_direction != 0)
+                    && (micro_direction != knob->micro_motion_direction)
+                    && (knob->micro_swing_since_reversal_deg
+                        >= knob->config.micro_oscillation_min_swing_deg)) {
+                    knob->micro_oscillation_reversals++;
+                    knob->micro_motion_direction = micro_direction;
+                    knob->micro_swing_since_reversal_deg = 0.0f;
+                } else if (knob->micro_motion_direction == 0) {
+                    knob->micro_motion_direction = micro_direction;
+                    knob->micro_swing_since_reversal_deg = 0.0f;
+                }
+            }
+            if ((knob->micro_damping_active == 0U)
+                && (fabsf(detent_error)
+                    <= knob->config.micro_damping_zone_deg)
+                && (knob->micro_oscillation_reversals >= 2U)) {
+                knob->micro_damping_active = 1U;
+                knob->micro_damping_elapsed_s = 0.0f;
+                knob->micro_oscillation_reversals = 0U;
+                knob->micro_oscillation_elapsed_s = 0.0f;
+            }
+        }
     }
 
     speed = clampf(speed_rpm,
@@ -307,6 +411,7 @@ float SmartKnob_Update(SmartKnob_t *knob,
     /* Keep the center slope soft while retaining a stronger outer pull. */
     spring_shape = knob->config.spring_center_scale
                  + (1.0f - knob->config.spring_center_scale)
+                 * spring_sine * spring_sine
                  * spring_sine * spring_sine;
     spring = spring_sine * spring_shape;
     spring += knob->config.spring_nonlinear_gain
@@ -351,6 +456,7 @@ float SmartKnob_Update(SmartKnob_t *knob,
             spring_sine = sinf(capture_phase);
             spring_shape = knob->config.spring_center_scale
                          + (1.0f - knob->config.spring_center_scale)
+                         * spring_sine * spring_sine
                          * spring_sine * spring_sine;
             capture_command = detent_peak_v * spring_sine * spring_shape;
             capture_command = clampf(capture_command,
@@ -364,6 +470,30 @@ float SmartKnob_Update(SmartKnob_t *knob,
                           : 1.0f;
             command = command * (1.0f - capture_scale)
                     + capture_command * capture_scale;
+        }
+    }
+    if (knob->micro_damping_active != 0U) {
+        if (fabsf(detent_error)
+            > knob->config.micro_damping_release_deg) {
+            knob->micro_damping_active = 0U;
+            knob->micro_damping_elapsed_s = 0.0f;
+        } else {
+            knob->micro_damping_elapsed_s += dt_s;
+            micro_damping_scale = (knob->config.micro_damping_ramp_s > 0.0f)
+                                ? clampf(knob->micro_damping_elapsed_s
+                                         / knob->config.micro_damping_ramp_s,
+                                         0.0f, 1.0f)
+                                : 1.0f;
+            micro_damping_command = knob->config.micro_damping_v_per_rpm
+                                  * speed;
+            if (knob->config.micro_damping_max_uq_v > 0.0f) {
+                micro_damping_command = knob->config.micro_damping_max_uq_v
+                                      * tanhf(micro_damping_command
+                                              / knob->config.micro_damping_max_uq_v);
+            }
+            /* Add damping only after capture blending, so it cannot be
+               overwritten by the position-only capture command. */
+            command -= micro_damping_command * micro_damping_scale;
         }
     }
     if (knob->config.startup_ramp_s > 0.0f) {

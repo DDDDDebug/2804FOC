@@ -24,6 +24,13 @@ typedef struct
     float oscillation_capture_max_uq_v; /**< 捕获阶段输出上限 */
     float oscillation_capture_ramp_s; /**< 捕获输出平滑时间 */
     float oscillation_capture_release_deg; /**< 解除锁定角度 */
+    float micro_oscillation_window_s; /**< 微振反转计数时间窗 */
+    float micro_oscillation_min_swing_deg; /**< 微振反转最小摆幅 */
+    float micro_damping_v_per_rpm; /**< 微振状态速度阻尼增益 */
+    float micro_damping_max_uq_v; /**< 微振状态阻尼上限 */
+    float micro_damping_ramp_s; /**< 微振阻尼渐入时间 */
+    float micro_damping_zone_deg; /**< 微振检测卡点范围 */
+    float micro_damping_release_deg; /**< 微振阻尼解除角度 */
     float max_uq_v;                 /**< 输出电压上限 */
     float max_speed_rpm;            /**< 参与阻尼计算的速度上限 */
 } SmartKnobConfig_t;
@@ -45,6 +52,12 @@ typedef struct
     int8_t motion_direction;
     uint8_t oscillation_reversals;
     uint8_t oscillation_capture_active;
+    float micro_swing_since_reversal_deg;
+    float micro_oscillation_elapsed_s;
+    float micro_damping_elapsed_s;
+    int8_t micro_motion_direction;
+    uint8_t micro_oscillation_reversals;
+    uint8_t micro_damping_active;
     uint8_t motion_initialized;
 } SmartKnob_t;
 
